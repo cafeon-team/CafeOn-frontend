@@ -35,7 +35,11 @@ function ReviewWriteContent() {
 
   const cafeId = existingReview?.cafeId ?? params.get("cafeId") ?? "";
   const cafe = getCafe(cafeId);
-  const cafeName = existingReview?.cafeName ?? cafe?.name ?? "카페";
+  const cafeName = existingReview?.cafeName ?? params.get("cafeName") ?? cafe?.name ?? "카페";
+  // 주문내역 > 주문 상세 화면의 "리뷰 남기기"에서 넘어올 때만 있어요. 카페
+  // 상세 화면에는 더 이상 리뷰 작성 진입점이 없어서(방문하지 않은 손님도 쓸 수
+  // 있던 문제), 리뷰는 항상 완료된 주문 하나를 인증으로 남겨요.
+  const orderId = existingReview?.orderId ?? params.get("orderId") ?? undefined;
 
   const [rating, setRating] = useState(existingReview?.rating ?? 5);
   const [content, setContent] = useState(existingReview?.content ?? "");
@@ -94,7 +98,7 @@ function ReviewWriteContent() {
       if (existingReview) {
         updateReview(existingReview.id, { rating, content, images });
       } else {
-        addReview({ cafeId, cafeName, rating, content, images });
+        addReview({ cafeId, cafeName, rating, content, images, orderId });
       }
       setSaved(true);
       setTimeout(() => router.push("/my/reviews"), 900);
@@ -114,6 +118,11 @@ function ReviewWriteContent() {
         <p className="mt-1 text-[13.5px] text-ink-muted">
           {isEdit ? "리뷰 내용을 수정해주세요" : "방문 후기를 남겨주세요"}
         </p>
+        {orderId && !isEdit && (
+          <span className="mt-2 inline-flex w-fit items-center rounded-full bg-sage-tint px-3 py-1 text-[12px] font-bold text-sage-dark">
+            주문 인증 리뷰 · 주문번호 {orderId}
+          </span>
+        )}
 
         <p className="mt-7 text-[15px] font-bold text-ink">별점</p>
         <div className="mt-2">

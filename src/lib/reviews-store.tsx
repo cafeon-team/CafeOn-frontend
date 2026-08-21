@@ -18,6 +18,9 @@ import {
 type ReviewsContextValue = {
   reviews: Review[];
   getReview: (id: string) => Review | undefined;
+  /** 특정 주문에 이미 남긴 리뷰가 있으면 돌려줘요. 주문 상세 화면이 "리뷰
+   * 남기기"와 "내가 남긴 리뷰 보기·수정" 버튼 중 뭘 보여줄지 여기로 판단해요. */
+  getReviewByOrderId: (orderId: string) => Review | undefined;
   addReview: (input: {
     cafeId: string;
     cafeName: string;
@@ -27,6 +30,9 @@ type ReviewsContextValue = {
      * 이미지 URL들. (서버의 리뷰 생성 API는 이미지 필드를 문서화하고 있지 않아서,
      * 카페 상세 "사진" 탭에서 쓸 수 있도록 이 기기에 함께 저장해둬요.) */
     images?: string[];
+    /** 이 리뷰가 인증하는 완료된 주문의 id. 있으면 서버에 order_id로 함께
+     * 보내서, "실제로 주문한 손님만 리뷰를 남긴다"는 걸 서버도 알 수 있어요. */
+    orderId?: string;
   }) => void;
   updateReview: (
     id: string,
@@ -92,18 +98,23 @@ export function ReviewsProvider({ children }: { children: ReactNode }) {
     () => ({
       reviews,
       getReview: (id) => reviews.find((r) => r.id === id),
-      addReview: ({ cafeId, cafeName, rating, content, images }) => {
+      getReviewByOrderId: (orderId) => reviews.find((r) => r.orderId === orderId),
+      addReview: ({ cafeId, cafeName, rating, content, images, orderId }) => {
         const now = new Date();
         const date = `${now.getFullYear()}.${String(now.getMonth() + 1).padStart(2, "0")}.${String(
           now.getDate()
         ).padStart(2, "0")}`;
         const localId = `r-${Date.now()}`;
         setReviews((prev) =>
-          persist([{ id: localId, cafeId, cafeName, rating, content, date, images }, ...prev])
+          persist([
+            { id: localId, cafeId, cafeName, rating, content, date, images, orderId },
+            ...prev,
+          ])
         );
 
         if (!isApiConfigured()) return;
-        void apiCreateReview(cafeId, { rating, content }).then((created) => {
+        const orderIdNum = orderId && /^\d+$/.test(orderId) ? Number(orderId) : undefined;
+        void apiCreateReview(cafeId, { rating, content, order_id: orderIdNum }).then((created) => {
           if (!created) return;
           // 서버가 실제로 발급해준 id로 바꿔서, 이후 수정·삭제가 서버에도 반영되게 해요.
           setReviews((prev) =>

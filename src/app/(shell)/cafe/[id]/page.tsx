@@ -240,17 +240,14 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
       )}
 
       {tab === "리뷰" && (
+        // ⚠️ 예전엔 여기 "리뷰 작성하기" 버튼으로 아무나(실제로 주문/방문하지
+        // 않은 손님도) 이 카페에 리뷰를 남길 수 있었어요. 이제 리뷰는 항상
+        // 완료된 주문 하나를 인증으로 남겨야 해서(주문내역 > 주문 상세 >
+        // 리뷰 남기기), 여기서는 작성 진입점 없이 리뷰만 보여줘요.
         <div className="flex flex-col gap-4 px-6 py-6">
-          <Link
-            href={`/my/reviews/write?cafeId=${cafe.id}`}
-            className="flex h-12 items-center justify-center rounded-2xl border border-brand text-[14px] font-bold text-brand"
-          >
-            리뷰 작성하기
-          </Link>
-
           {cafeReviews.length === 0 ? (
             <p className="mt-8 text-center text-[14px] text-ink-muted">
-              아직 작성된 리뷰가 없어요. 첫 리뷰를 남겨보세요!
+              아직 작성된 리뷰가 없어요.
             </p>
           ) : (
             <div className="flex flex-col gap-3">
@@ -267,6 +264,10 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
               ))}
             </div>
           )}
+
+          <p className="text-center text-[12.5px] text-ink-muted">
+            이 카페에서 주문을 완료하면 주문내역에서 리뷰를 남길 수 있어요.
+          </p>
         </div>
       )}
 

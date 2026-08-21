@@ -22,6 +22,9 @@ export type OrderStatus = "결제대기" | "주문접수" | "준비중" | "준�
 
 export type MyOrder = {
   id: string;
+  /** 이 주문을 받은 매장의 서버 id. 리뷰 작성 화면(POST /api/stores/{store}/reviews)에
+   * 어느 매장에 리뷰를 남기는지 알려주려면 필요해요. */
+  cafeId: string | null;
   cafeName: string;
   date: string;
   status: OrderStatus;
@@ -55,6 +58,7 @@ function toOrderStatus(raw: string): OrderStatus {
 function mapApiOrder(o: ApiOrderDetail): MyOrder {
   return {
     id: String(o.id),
+    cafeId: o.storeId !== null && o.storeId !== undefined ? String(o.storeId) : null,
     cafeName: o.storeName ?? (o.storeId ? `매장 #${o.storeId}` : "매장"),
     date: o.createdAt?.slice(0, 10) ?? "",
     status: toOrderStatus(o.status),

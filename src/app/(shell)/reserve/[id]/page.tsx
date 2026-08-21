@@ -2,9 +2,12 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { ChevronLeft } from "lucide-react";
+import Link from "next/link";
+import { ChevronLeft, ChevronRight, Star } from "lucide-react";
 import { useOrders } from "@/lib/orders-store";
 import type { OrderStatus } from "@/lib/orders-store";
+import { useReviews } from "@/lib/reviews-store";
+import StarRating from "@/components/StarRating";
 
 const stateStyle: Record<OrderStatus, string> = {
   결제대기: "bg-border text-ink-muted",
@@ -24,6 +27,11 @@ export default function OrderDetailPage({
   const { orders, cancelOrder } = useOrders();
   const order = orders.find((o) => o.id === params.id);
   const [cancelling, setCancelling] = useState(false);
+  // ⚠️ 리뷰는 이제 카페 상세가 아니라 여기(완료된 주문)에서만 남길 수 있어요.
+  // 이미 이 주문으로 리뷰를 남겼으면 "리뷰 남기기" 대신 내가 쓴 리뷰를
+  // 보여주고, 아직이면 작성 화면으로 보내요.
+  const { getReviewByOrderId } = useReviews();
+  const myReview = order ? getReviewByOrderId(order.id) : undefined;
 
   if (!order) {
     return (
@@ -102,6 +110,35 @@ export default function OrderDetailPage({
             </button>
           </div>
         )}
+
+        {order.status === "완료" &&
+          (myReview ? (
+            <Link
+              href={`/my/reviews/write?reviewId=${myReview.id}`}
+              className="mt-6 flex flex-col gap-2 rounded-2xl border border-border bg-white p-5"
+            >
+              <div className="flex items-center justify-between">
+                <p className="text-[13.5px] font-bold text-ink">내가 남긴 리뷰</p>
+                <span className="flex items-center gap-1 text-[12.5px] font-bold text-brand">
+                  수정하기 <ChevronRight size={14} />
+                </span>
+              </div>
+              <StarRating rating={myReview.rating} />
+              <p className="line-clamp-2 text-[13.5px] leading-relaxed text-ink-secondary">
+                {myReview.content}
+              </p>
+            </Link>
+          ) : (
+            <Link
+              href={`/my/reviews/write?cafeId=${order.cafeId ?? ""}&cafeName=${encodeURIComponent(
+                order.cafeName,
+              )}&orderId=${order.id}`}
+              className="mt-6 flex h-12 w-full items-center justify-center gap-1.5 rounded-xl bg-brand text-[14px] font-bold text-white"
+            >
+              <Star size={15} className="fill-white" />
+              리뷰 남기기
+            </Link>
+          ))}
       </div>
     </div>
   );

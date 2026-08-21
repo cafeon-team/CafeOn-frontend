@@ -1,20 +1,22 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Star, Trash2 } from "lucide-react";
+import { Star } from "lucide-react";
 import Header from "@/components/Header";
 import SortDropdown from "@/components/SortDropdown";
+import ImagePlaceholder from "@/components/ImagePlaceholder";
 import { useOwner } from "@/lib/owner-store";
+import { resolveImageUrl } from "@/lib/api";
 
 const SORT_OPTIONS = ["최신순", "오래된순"] as const;
 
 export default function OwnerReviewsPage() {
-  const { reviews, replyToReview, removeReview } = useOwner();
+  const { reviews, replyToReview, deleteReviewReply } = useOwner();
   const [tab, setTab] = useState<"전체 리뷰" | "답변 완료">("전체 리뷰");
   const [sort, setSort] = useState<"최신순" | "오래된순">("최신순");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [confirmDeleteReplyId, setConfirmDeleteReplyId] = useState<string | null>(null);
 
   const startReply = (id: string, current: string | null) => {
     setEditingId(id);
@@ -23,7 +25,9 @@ export default function OwnerReviewsPage() {
 
   const submit = () => {
     if (!editingId) return;
-    replyToReview(editingId, draft.trim());
+    const trimmed = draft.trim();
+    if (!trimmed) return;
+    replyToReview(editingId, trimmed);
     setEditingId(null);
     setDraft("");
   };
@@ -81,33 +85,24 @@ export default function OwnerReviewsPage() {
             key={rv.id}
             className="rounded-2xl border border-border bg-white p-5"
           >
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5">
-                <div className="flex items-center gap-0.5">
-                  {Array.from({ length: 5 }).map((_, i) => (
-                    <Star
-                      key={i}
-                      size={14}
-                      className={
-                        i < Math.round(rv.rating)
-                          ? "fill-brand text-brand"
-                          : "fill-border text-border"
-                      }
-                    />
-                  ))}
-                </div>
-                <span className="text-[15px] font-bold text-ink">
-                  {rv.rating.toFixed(1)}
-                </span>
-                <span className="text-[12.5px] text-ink-muted">{rv.date}</span>
+            <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-0.5">
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <Star
+                    key={i}
+                    size={14}
+                    className={
+                      i < Math.round(rv.rating)
+                        ? "fill-brand text-brand"
+                        : "fill-border text-border"
+                    }
+                  />
+                ))}
               </div>
-              <button
-                onClick={() => setConfirmDeleteId(rv.id)}
-                aria-label="리뷰 삭제"
-                className="flex h-7 w-7 items-center justify-center text-ink-muted"
-              >
-                <Trash2 size={15} />
-              </button>
+              <span className="text-[15px] font-bold text-ink">
+                {rv.rating.toFixed(1)}
+              </span>
+              <span className="text-[12.5px] text-ink-muted">{rv.date}</span>
             </div>
             <p className="mt-1.5 text-[15px] font-bold text-ink">
               {rv.customerName}
@@ -116,11 +111,31 @@ export default function OwnerReviewsPage() {
               {rv.content}
             </p>
 
+            {rv.images.length > 0 && (
+              <div className="mt-3 flex gap-2 overflow-x-auto">
+                {rv.images.map((src, i) => (
+                  <ImagePlaceholder
+                    key={`${src}-${i}`}
+                    className="h-16 w-16 shrink-0"
+                    iconSize={14}
+                    src={resolveImageUrl(src)}
+                    alt={`${rv.customerName} 리뷰 사진 ${i + 1}`}
+                  />
+                ))}
+              </div>
+            )}
+
             {rv.reply && editingId !== rv.id && (
               <div className="mt-3 rounded-xl bg-trust-tint/50 p-3">
-                <p className="text-[12.5px] font-bold text-trust">
-                  사장님 답글
-                </p>
+                <div className="flex items-center justify-between">
+                  <p className="text-[12.5px] font-bold text-trust">
+                    사장님 답글
+                  </p>
+                  <div className="flex items-center gap-3 text-[12px] font-bold text-ink-muted">
+                    <button onClick={() => startReply(rv.id, rv.reply)}>수정</button>
+                    <button onClick={() => setConfirmDeleteReplyId(rv.id)}>삭제</button>
+                  </div>
+                </div>
                 <p className="mt-1 text-[14px] leading-relaxed text-ink-secondary">
                   {rv.reply}
                 </p>
@@ -138,56 +153,57 @@ export default function OwnerReviewsPage() {
                 />
                 <div className="flex justify-end gap-2">
                   <button
-                    onClick={() => setEditingId(null)}
+                    onClick={() => {
+                      setEditingId(null);
+                      setDraft("");
+                    }}
                     className="h-9 rounded-lg px-3 text-[13px] font-bold text-ink-muted"
                   >
                     취소
                   </button>
                   <button
                     onClick={submit}
-                    className="h-9 rounded-lg bg-trust px-4 text-[13px] font-bold text-white"
+                    disabled={!draft.trim()}
+                    className="h-9 rounded-lg bg-trust px-4 text-[13px] font-bold text-white disabled:opacity-50"
                   >
                     등록
                   </button>
                 </div>
               </div>
             ) : (
-              <div className="mt-3 flex justify-start">
-                <button
-                  onClick={() => startReply(rv.id, rv.reply)}
-                  className={
-                    "rounded-full px-4 py-1.5 text-[13px] font-bold " +
-                    (rv.reply
-                      ? "bg-trust-tint text-trust"
-                      : "border border-trust text-trust")
-                  }
-                >
-                  {rv.reply ? "답변 완료" : "답변하기"}
-                </button>
-              </div>
+              !rv.reply && (
+                <div className="mt-3 flex justify-start">
+                  <button
+                    onClick={() => startReply(rv.id, rv.reply)}
+                    className="rounded-full border border-trust px-4 py-1.5 text-[13px] font-bold text-trust"
+                  >
+                    답변하기
+                  </button>
+                </div>
+              )
             )}
           </div>
         ))}
       </div>
 
-      {confirmDeleteId && (
+      {confirmDeleteReplyId && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-8">
           <div className="w-full max-w-[320px] rounded-2xl bg-white p-6">
-            <p className="text-[16px] font-bold text-ink">리뷰를 삭제할까요?</p>
+            <p className="text-[16px] font-bold text-ink">답글을 삭제할까요?</p>
             <p className="mt-1.5 text-[13.5px] text-ink-secondary">
-              삭제한 리뷰는 다시 되돌릴 수 없어요.
+              삭제한 답글은 다시 되돌릴 수 없어요. (리뷰 자체는 지워지지 않아요)
             </p>
             <div className="mt-5 flex gap-2">
               <button
-                onClick={() => setConfirmDeleteId(null)}
+                onClick={() => setConfirmDeleteReplyId(null)}
                 className="h-11 flex-1 rounded-xl border border-border text-[14px] font-bold text-ink-secondary"
               >
                 취소
               </button>
               <button
                 onClick={() => {
-                  removeReview(confirmDeleteId);
-                  setConfirmDeleteId(null);
+                  deleteReviewReply(confirmDeleteReplyId);
+                  setConfirmDeleteReplyId(null);
                 }}
                 className="h-11 flex-1 rounded-xl bg-trust text-[14px] font-bold text-white"
               >
@@ -200,3 +216,4 @@ export default function OwnerReviewsPage() {
     </div>
   );
 }
+

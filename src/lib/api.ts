@@ -1562,18 +1562,67 @@ export async function apiOwnerUpdateOrderStatus(
   return false;
 }
 
-/** POST /api/owner/reviews/{review}/reply */
+/** POST /api/owner/reviews/{review}/reply
+ * ⚠️ 스웨거에 성공 응답 스키마가 없어서(설명만 "성공"), 생성된 답글의 id를
+ * 응답에서 알아낼 수 있을지는 서버 구현에 달려있어요. 흔히 쓰는 후보 필드명을
+ * 순서대로 시도해서 있으면 replyId로 돌려주고, 없으면 null이에요(그래도 답글
+ * 등록 자체는 성공한 상태 — 이후 수정/삭제만 이 화면 새로고침 전까진 못 함). */
 export async function apiOwnerReplyToReview(
   reviewId: string | number,
+  content: string,
+): Promise<{ ok: true; replyId: string | null } | { ok: false }> {
+  if (!isApiConfigured()) return { ok: false };
+  try {
+    const res = await apiFetch<Record<string, unknown>>(
+      `/api/owner/reviews/${encodeURIComponent(String(reviewId))}/reply`,
+      {
+        method: "POST",
+        body: { content },
+        authAs: "owner",
+      },
+    );
+    const raw =
+      res && typeof res === "object" && "reply" in res
+        ? ((res as { reply?: Record<string, unknown> }).reply ?? {})
+        : (res ?? {});
+    const id = (raw as Record<string, unknown>)["id"];
+    return { ok: true, replyId: id !== undefined && id !== null ? String(id) : null };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** PUT /api/owner/review-replies/{reply} — 이미 등록한 답글 내용 수정 */
+export async function apiOwnerUpdateReviewReply(
+  replyId: string | number,
   content: string,
 ): Promise<boolean> {
   if (!isApiConfigured()) return false;
   try {
     await apiFetch(
-      `/api/owner/reviews/${encodeURIComponent(String(reviewId))}/reply`,
+      `/api/owner/review-replies/${encodeURIComponent(String(replyId))}`,
       {
-        method: "POST",
+        method: "PUT",
         body: { content },
+        authAs: "owner",
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** DELETE /api/owner/review-replies/{reply} — 등록한 답글 삭제 */
+export async function apiOwnerDeleteReviewReply(
+  replyId: string | number,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(
+      `/api/owner/review-replies/${encodeURIComponent(String(replyId))}`,
+      {
+        method: "DELETE",
         authAs: "owner",
       },
     );

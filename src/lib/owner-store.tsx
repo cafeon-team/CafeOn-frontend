@@ -20,6 +20,8 @@ import {
   apiOwnerUpdateOrderStatus,
   type ApiOrderDetail,
   apiOwnerReplyToReview,
+  apiOwnerUpdateReviewReply,
+  apiOwnerDeleteReviewReply,
   apiOwnerListSeats,
   apiOwnerCreateSeat,
   apiOwnerDeleteSeat,
@@ -91,6 +93,14 @@ export type OwnerReview = {
   content: string;
   date: string;
   reply: string | null;
+  /** 이 리뷰에 남긴 내 답글의 서버 id. PUT/DELETE /api/owner/review-replies/{reply}에
+   * 필요해요. 답글을 아직 안 남겼거나, 남겼지만 서버 응답에서 id를 못 찾았으면
+   * null이에요(그런 경우엔 새로 POST해서 등록해요 — 중복 답글은 서버가 422로
+   * 막아줄 거예요). */
+  replyId: string | null;
+  /** 손님이 리뷰에 첨부한 사진(있는 경우). 서버 응답 스키마가 문서화돼 있지
+   * 않아서 흔한 필드명을 후보로 시도해요. */
+  images: string[];
 };
 
 /** 매장 태그(카테고리)로 고를 수 있는 항목들. 매장 프로필 화면과 아래
@@ -323,11 +333,25 @@ function mapApiReviewToOwnerReview(review: ApiReview): OwnerReview {
     (raw["user_name"] as string | undefined) ??
     (user?.["name"] as string | undefined) ??
     "고객";
+  // 답글이 문자열로 그대로 오거나({reply: "내용"}), 객체로 오거나
+  // ({reply: {id, content}} / {owner_reply: {...}}) 둘 다 대응해요.
+  const replyRaw = raw["reply"] ?? raw["owner_reply"];
+  const replyObj =
+    replyRaw && typeof replyRaw === "object" ? (replyRaw as Record<string, unknown>) : undefined;
   const reply =
-    (raw["reply"] as string | undefined) ??
-    (raw["owner_reply"] as string | undefined) ??
-    ((raw["reply"] as Record<string, unknown> | undefined)?.["content"] as string | undefined) ??
+    (typeof replyRaw === "string" ? replyRaw : undefined) ??
+    (replyObj?.["content"] as string | undefined) ??
     null;
+  const replyId =
+    (raw["reply_id"] as string | number | undefined) ??
+    (raw["owner_reply_id"] as string | number | undefined) ??
+    (replyObj?.["id"] as string | number | undefined);
+  const imagesRaw = raw["images"] ?? raw["photos"] ?? raw["photo_urls"];
+  const images = Array.isArray(imagesRaw)
+    ? imagesRaw
+        .map((v) => (typeof v === "string" ? v : (v as Record<string, unknown>)?.["url"]))
+        .filter((v): v is string => typeof v === "string")
+    : [];
   return {
     id: String(review.id),
     customerName,
@@ -335,6 +359,8 @@ function mapApiReviewToOwnerReview(review: ApiReview): OwnerReview {
     content: review.content,
     date: review.created_at?.slice(0, 10).replace(/-/g, ".") ?? "",
     reply: reply ?? null,
+    replyId: replyId !== undefined && replyId !== null ? String(replyId) : null,
+    images,
   };
 }
 
@@ -423,8 +449,13 @@ type OwnerContextValue = {
   removeMenuItem: (id: string) => void;
 
   reviews: OwnerReview[];
+  /** 답글을 새로 남기거나(POST) 이미 남긴 답글을 수정해요(PUT). 어느 쪽인지는
+   * 해당 리뷰의 replyId 유무로 자동 판단해요. */
   replyToReview: (id: string, reply: string) => void;
-  removeReview: (id: string) => void;
+  /** 남긴 답글을 삭제해요(DELETE /api/owner/review-replies/{reply}). 손님이
+   * 작성한 리뷰 자체는 사장님이 지울 수 있는 API가 없어서(문서화된 엔드포인트
+   * 없음), 답글만 지워요. */
+  deleteReviewReply: (id: string) => void;
 
   settings: SettingsState;
   setSettings: (patch: Partial<SettingsState>) => void;
@@ -950,12 +981,35 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
   };
 
   const replyToReview = (id: string, reply: string) => {
-    setReviews((prev) => prev.map((r) => (r.id === id ? { ...r, reply } : r)));
-    if (ownerStoreId) void apiOwnerReplyToReview(id, reply);
+    const trimmed = reply.trim();
+    const target = reviews.find((r) => r.id === id);
+    setReviews((prev) => prev.map((r) => (r.id === id ? { ...r, reply: trimmed } : r)));
+    if (!ownerStoreId) return;
+    if (target?.replyId) {
+      // 이미 서버에 답글이 있으면(=replyId를 알고 있으면) 새로 만들지 않고
+      // 그 답글을 수정해요. 안 그러면 POST가 "이미 답글이 있다"고 422를
+      // 돌려주거나, 리뷰당 답글이 여러 개 쌓일 수 있어요.
+      void apiOwnerUpdateReviewReply(target.replyId, trimmed);
+    } else {
+      void apiOwnerReplyToReview(id, trimmed).then((res) => {
+        if (res.ok && res.replyId) {
+          setReviews((prev) =>
+            prev.map((r) => (r.id === id ? { ...r, replyId: res.replyId } : r))
+          );
+        }
+      });
+    }
   };
 
-  const removeReview = (id: string) =>
-    setReviews((prev) => prev.filter((r) => r.id !== id));
+  const deleteReviewReply = (id: string) => {
+    const target = reviews.find((r) => r.id === id);
+    setReviews((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, reply: null, replyId: null } : r))
+    );
+    if (ownerStoreId && target?.replyId) {
+      void apiOwnerDeleteReviewReply(target.replyId);
+    }
+  };
 
   const setSettings = (patch: Partial<SettingsState>) =>
     setSettingsState((prev) => ({ ...prev, ...patch }));
@@ -1009,7 +1063,7 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
       removeMenuItem,
       reviews,
       replyToReview,
-      removeReview,
+      deleteReviewReply,
       settings,
       setSettings,
       inquiries,
