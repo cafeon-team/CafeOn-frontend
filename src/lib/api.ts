@@ -1,0 +1,1877 @@
+import type { SalesPoint } from "@/lib/owner-store";
+
+/**
+ * 백엔드 API 연동 설정 (CafeOn Backend API v2.0.0, Laravel + Sanctum)
+ * ------------------------------------------------------------------
+ * .env.local 에 NEXT_PUBLIC_API_BASE_URL 을 넣으면 실제 서버로 요청을 보내요.
+ *   예) NEXT_PUBLIC_API_BASE_URL=https://api.cafeon.app
+ *
+ * 아직 이 값이 없으면(백엔드 URL을 못 받은 상태) 네트워크 요청 자체를
+ * 시도하지 않고 프론트가 갖고 있는 임시(mock) 데이터를 그대로 보여줘요.
+ * 그래서 URL만 채워 넣으면 별도 코드 수정 없이 바로 연동돼요.
+ *
+ * 인증: Laravel Sanctum Bearer Token.
+ * - 손님 토큰과 사장님 토큰은 별개로 보관해요(한 브라우저에서 손님/사장님 화면을
+ *   각각 "로그인 상태"로 유지하는 이 앱의 화면 구조에 맞춘 설계예요).
+ * - 이 파일의 모든 함수는 실패해도 절대 예외를 던지지 않고(내부에서 잡아서)
+ *   null / 기본값을 돌려줘요. 그래야 호출하는 쪽 store들이 항상 기존 화면을
+ *   유지한 채로 동작할 수 있어요 (백엔드 미기동·네트워크 오류에도 화면이 안 깨짐).
+ */
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+
+export function isApiConfigured() {
+  return API_BASE_URL.length > 0;
+}
+
+/**
+ * 서버가 돌려주는 이미지 경로를 화면에서 실제로 열 수 있는 절대 URL로 바꿔줘요.
+ * ------------------------------------------------------------------
+ * 백엔드(Laravel)는 업로드 응답이나 프로필/매장/메뉴 이미지 필드에
+ * "/storage/xxx.jpg" 같은 "상대 경로"를 돌려줘요. 이 문자열을 <img src>에
+ * 그대로 넣으면 브라우저는 이걸 프론트 앱 자신의 주소(예: http://localhost:3000/storage/xxx.jpg)
+ * 기준으로 풀어버려서 이미지가 깨져요(요청한 서버에는 그 경로가 없으니까요).
+ * 그래서 "/"로 시작하는 상대 경로는 API_BASE_URL을 붙여 절대 주소로 만들어줘요.
+ * data:(로컬 미리보기)나 http(s):(이미 절대 주소)로 시작하면 그대로 둬요.
+ */
+export function resolveImageUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  if (/^(data:|blob:)/i.test(url)) return url;
+  if (!API_BASE_URL) return url;
+  const base = API_BASE_URL.replace(/\/$/, "");
+
+  if (/^https?:\/\//i.test(url)) {
+    try {
+      const parsed = new URL(url);
+      const baseParsed = new URL(base);
+      if (parsed.origin !== baseParsed.origin) {
+        return `${base}${parsed.pathname}${parsed.search}`;
+      }
+      return url;
+    } catch {
+      return url;
+    }
+  }
+
+  const path = url.startsWith("/") ? url : `/${url}`;
+  return `${base}${path}`;
+}
+
+/* ------------------------------ 토큰 저장소 ------------------------------ */
+
+const CUSTOMER_TOKEN_KEY = "cafeon_token";
+const OWNER_TOKEN_KEY = "cafeon_owner_token";
+const OWNER_STORE_ID_KEY = "cafeon_owner_store_id";
+
+function readStorage(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStorage(key: string, value: string | null) {
+  if (typeof window === "undefined") return;
+  try {
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    // 시크릿 모드 등 localStorage를 못 쓰는 환경이면 조용히 무시해요.
+  }
+}
+
+export function getCustomerToken() {
+  return readStorage(CUSTOMER_TOKEN_KEY);
+}
+export function setCustomerToken(token: string | null) {
+  writeStorage(CUSTOMER_TOKEN_KEY, token);
+}
+
+export function getOwnerToken() {
+  return readStorage(OWNER_TOKEN_KEY);
+}
+export function setOwnerToken(token: string | null) {
+  writeStorage(OWNER_TOKEN_KEY, token);
+}
+
+/** 사장님 계정에 연결된 매장 ID. owner/signup 응답에만 store가 포함돼 있어서
+ * 최초 가입 시 저장해두고, 이후 로그인 때도 재사용해요. */
+export function getOwnerStoreId(): number | null {
+  const raw = readStorage(OWNER_STORE_ID_KEY);
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+export function setOwnerStoreId(storeId: number | null) {
+  writeStorage(OWNER_STORE_ID_KEY, storeId === null ? null : String(storeId));
+}
+
+/* -------------------------------- 공통 fetch -------------------------------- */
+
+export class ApiError extends Error {
+  status: number;
+  fieldErrors?: Record<string, string[]>;
+  constructor(
+    message: string,
+    status: number,
+    fieldErrors?: Record<string, string[]>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.fieldErrors = fieldErrors;
+  }
+}
+
+type AuthAs = "customer" | "owner" | "none";
+
+/**
+ * ⚠️ 이전엔 fetch()에 타임아웃이 전혀 없어서, 서버가 응답을 안 주거나(개발용
+ * `php artisan serve`는 요청을 한 번에 하나씩만 처리하는 단일 스레드라, 화면에
+ * 떠 있는 8~15초 폴링들이 겹치면 뒤에 보낸 요청이 한참 대기할 수 있어요)
+ * 네트워크가 중간에 끊기면 화면이 "주문을 생성하는 중이에요…"처럼 영원히
+ * 멈춰 보였어요(스피너만 돌고 성공도 실패도 안 뜸). 일정 시간 안에 응답이 없으면
+ * 스스로 요청을 취소하고 명확한 에러로 실패 처리해서, 호출한 쪽 화면이 항상
+ * "성공" 아니면 "실패(재시도 가능)" 둘 중 하나로 끝나게 해요.
+ */
+const DEFAULT_TIMEOUT_MS = 15000;
+
+async function apiFetch<T>(
+  path: string,
+  options: {
+    method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+    body?: unknown;
+    query?: Record<string, string | number | boolean | undefined>;
+    authAs?: AuthAs;
+    timeoutMs?: number;
+  } = {},
+): Promise<T> {
+  const { method = "GET", body, query, authAs = "none", timeoutMs = DEFAULT_TIMEOUT_MS } = options;
+
+  let url = `${API_BASE_URL}${path}`;
+  if (query) {
+    const qs = Object.entries(query)
+      .filter(([, v]) => v !== undefined && v !== "")
+      .map(
+        ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`,
+      )
+      .join("&");
+    if (qs) url += `?${qs}`;
+  }
+
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+  };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  const token =
+    authAs === "customer"
+      ? getCustomerToken()
+      : authAs === "owner"
+        ? getOwnerToken()
+        : null;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new ApiError(
+        `서버 응답이 ${Math.round(timeoutMs / 1000)}초 안에 오지 않았어요. 네트워크나 서버 상태를 확인해주세요.`,
+        0,
+      );
+    }
+    throw new ApiError("서버에 연결할 수 없어요. 네트워크 상태를 확인해주세요.", 0);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (res.status === 204) return undefined as T;
+
+  let data: unknown = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+
+  if (!res.ok) {
+    const d = (data ?? {}) as {
+      message?: string;
+      errors?: Record<string, string[]>;
+    };
+    throw new ApiError(
+      d.message ?? `요청에 실패했어요 (${res.status})`,
+      res.status,
+      d.errors,
+    );
+  }
+
+  return data as T;
+}
+
+/* ---------------------------------- 인증 ---------------------------------- */
+
+export type ApiUser = {
+  id: number;
+  name: string;
+  email: string;
+  phone?: string | null;
+  profile_image_url?: string | null;
+  /** 2026-08-19 백엔드 변경사항 문서로 추가됨: 손님 생년월일(YYYY-MM-DD).
+   * 저장 후에는 로그인 응답과 GET /api/users/me 양쪽에서 이 필드로 내려와요. */
+  birth_date?: string | null;
+  role: "CUSTOMER" | "OWNER" | "ADMIN";
+};
+
+export type ApiStoreBusinessHour = {
+  day_of_week: number;
+  opening_time?: string | null;
+  closing_time?: string | null;
+  is_closed?: boolean;
+};
+
+export type ApiStoreTag = {
+  id?: number;
+  slug?: string | null;
+  name?: string | null;
+};
+
+/** 2026-08-19 백엔드 변경사항 문서(카카오지도_카페나오기.txt)로 추가됨: 사업자 정보.
+ * 공개 매장 API에는 노출되지 않고, 사장님 전용 조회/수정 응답에만 포함돼요. */
+export type ApiStoreBusinessInfo = {
+  business_registration_number?: string | null;
+  representative_name?: string | null;
+  company_name?: string | null;
+  business_type?: string | null;
+  business_item?: string | null;
+  business_address?: string | null;
+};
+
+export type ApiStore = {
+  id: number;
+  name: string;
+  slug: string;
+  description?: string | null;
+  address?: string | null;
+  detail_address?: string | null;
+  phone?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  thumbnail_url?: string | null;
+  reservation_enabled: boolean;
+  is_active: boolean;
+  /** 2026-08-19 백엔드 변경사항 문서로 추가됨: "현재 영업 중" 여부.
+   * is_active(매장 게시·활성 여부)와는 다른 개념이에요 — 매장은 활성 상태(is_active)이면서도
+   * 지금은 영업 종료(is_open=false)일 수 있어요. 구버전 응답엔 없을 수 있어서 optional. */
+  is_open?: boolean;
+  /** 요일별 영업시간. api-docs.json 스웨거에는 상세 스키마가 안 나와있어서
+   * 실제 응답을 보고 채워 넣은 타입이에요 — 필드명이 다르면 카페 상세/지도 화면의
+   * 영업시간 표시가 "-"로 폴백돼요(에러는 안 나요). */
+  business_hours?: ApiStoreBusinessHour[] | null;
+  /** 편의시설 등 매장 태그. slug만 사용해요(wifi/outlet/parking/pet). */
+  tags?: ApiStoreTag[] | null;
+  /** 사업자 정보(사업자등록번호 등). 공개 매장 API에는 노출되지 않아요. */
+  business_info?: ApiStoreBusinessInfo | null;
+};
+
+/** POST /api/auth/customer/login — 손님 전용 로그인.
+ * 백엔드가 CUSTOMER 권한 계정만 통과시켜요(사장님 계정으로 시도하면 403). */
+export async function apiCustomerLogin(email: string, password: string) {
+  return apiFetch<{ token: string; token_type: string; user: ApiUser }>(
+    "/api/auth/customer/login",
+    { method: "POST", body: { email, password } },
+  );
+}
+
+/** POST /api/auth/owner/login — 사장님 전용 로그인.
+ * 백엔드가 ADMIN 권한 계정만 통과시켜요(손님 계정으로 시도하면 403). */
+export async function apiOwnerLogin(email: string, password: string) {
+  return apiFetch<{
+    token: string;
+    token_type: string;
+    user: ApiUser;
+    /** 2026-08-19 백엔드 변경사항 문서(사장님 프로필 로그아웃 후 복원)로 추가됨:
+     * 로그인한 사장님이 실제 OWNER로 연결된 매장 정보가 로그인 응답에도 함께 와요.
+     * store_id 또는 store.id를 ownerStoreId로 저장해서 써요.
+     * store는 첫 번째 소유 매장, stores는 소유 매장 전체 목록이에요. */
+    store_id?: number;
+    store?: ApiStore;
+    stores?: ApiStore[];
+  }>("/api/auth/owner/login", { method: "POST", body: { email, password } });
+}
+
+/** GET /api/owner/store — 로그인한 사장님의 대표 매장을 조회해요.
+ * 2026-08-19 백엔드 변경사항 문서(사장님 프로필 로그아웃 후 복원)로 추가됨.
+ * 로그인/소셜로그인 응답에 store_id·store가 안 실려 있을 때(구버전 응답 등)나,
+ * 새로고침으로 앱을 다시 열었는데 저장해둔 ownerStoreId가 없을 때, 로그인한
+ * 계정에 실제 연결된 매장 ID를 서버에서 다시 찾아오는 용도로 써요. 응답 형태가
+ * 스웨거에 상세히 안 나와있어서 { store: ApiStore } 형태와 매장 객체를 바로
+ * 주는 형태를 모두 시도해요. */
+export async function apiOwnerGetMyStore(): Promise<ApiStore | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<Record<string, unknown>>("/api/owner/store", {
+      authAs: "owner",
+    });
+    const store = (res?.["store"] ?? res) as ApiStore | undefined;
+    return store && typeof store.id === "number" ? store : null;
+  } catch {
+    return null;
+  }
+}
+
+/** POST /api/auth/signup — 손님 회원가입 */
+export async function apiSignup(input: {
+  name: string;
+  email: string;
+  password: string;
+  terms_accepted: boolean;
+}) {
+  return apiFetch<{
+    message: string;
+    token: string;
+    token_type: string;
+    user: ApiUser;
+  }>("/api/auth/signup", { method: "POST", body: input });
+}
+
+/** POST /api/auth/owner/signup — 사장님(점주) 회원가입. 응답에 store가 함께 와요. */
+export async function apiOwnerSignup(input: {
+  name: string;
+  email: string;
+  password: string;
+  password_confirmation: string;
+  phone: string;
+  store_name: string;
+  store_address?: string;
+  store_detail_address?: string;
+  store_phone?: string;
+  terms_accepted: boolean;
+}) {
+  return apiFetch<{
+    message: string;
+    token: string;
+    token_type: string;
+    user: ApiUser;
+    store: ApiStore;
+  }>("/api/auth/owner/signup", { method: "POST", body: input });
+}
+
+/** 소셜 로그인(카카오/구글/네이버) 시작 URL.
+ * 이 URL로 이동(location.href)하면 백엔드가 각 소셜 로그인 페이지로 리다이렉트해요.
+ * 로그인이 끝나면 백엔드가 손님은 FRONTEND_SOCIAL_CALLBACK_URL(=/login/callback),
+ * 사장님은 /owner/login/callback 으로 ?code=...(또는 실패 시 ?error=...)와 함께
+ * 다시 리다이렉트해줘요. */
+export type SocialProvider = "kakao" | "google" | "naver";
+/** 손님/사장님 중 어떤 계정으로 소셜 로그인을 시작하는지 구분해요. */
+export type SocialAuthAs = "customer" | "owner";
+
+/**
+ * ⚠️ 백엔드 확인 필요: 로그인이 /api/auth/customer/login, /api/auth/owner/login 으로
+ * 분리된 것과 맞춰서 소셜 로그인도 role 파라미터로 구분해서 보내도록 만들어뒀어요.
+ * 다만 api-docs.json(스웨거)에는 이 리다이렉트 경로 자체가 명세돼 있지 않아서,
+ * 백엔드가 실제로 이 role 파라미터명을 그대로 쓰는지, 아니면 콜백 URL을 아예
+ * 다르게 분리하는 방식(FRONTEND_SOCIAL_CALLBACK_URL을 손님/사장님용으로 각각 설정)을
+ * 쓰는지는 백엔드 팀에 꼭 확인해주세요.
+ */
+export function getSocialLoginUrl(provider: SocialProvider, as: SocialAuthAs) {
+  return `${API_BASE_URL}/auth/social/${provider}/redirect?role=${as}`;
+}
+
+/** POST /api/auth/social/exchange — 소셜 로그인 콜백에서 받은 1회용 code를
+ * 실제 Sanctum 토큰으로 교환해요. role은 위 getSocialLoginUrl과 같은 이유로 함께
+ * 보내요(백엔드가 이 필드를 쓰는지는 확인 필요, 안 쓰더라도 무시되므로 안전해요). */
+export async function apiSocialExchange(code: string, as: SocialAuthAs) {
+  return apiFetch<{
+    token: string;
+    token_type: string;
+    user: ApiUser;
+    /** 2026-08-19 백엔드 변경사항 문서로 추가됨: 사장님 계정 소셜 로그인 시
+     * 일반 로그인과 동일하게 store_id/store가 함께 와요(손님 계정이면 없어요). */
+    store_id?: number;
+    store?: ApiStore;
+    stores?: ApiStore[];
+  }>("/api/auth/social/exchange", { method: "POST", body: { code, role: as } });
+}
+
+/** POST /api/logout */
+export async function apiLogout(authAs: AuthAs) {
+  try {
+    await apiFetch<void>("/api/logout", { method: "POST", authAs });
+  } catch {
+    // 서버 로그아웃이 실패해도 클라이언트 쪽 토큰은 어차피 지울 거라 무시해요.
+  }
+}
+
+/** GET /api/users/me */
+export async function apiGetMe(authAs: AuthAs): Promise<ApiUser | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<{ user: ApiUser }>("/api/users/me", { authAs });
+    return res.user;
+  } catch {
+    return null;
+  }
+}
+
+/** PUT /api/users/me — 손님 프로필 수정(이름/연락처/프로필사진/생년월일 등).
+ * 로그인/회원가입과 달리 사용자가 직접 "저장하기"를 눌러서 호출하는 동작이라,
+ * 실패 사유(중복된 번호, 미래 날짜의 birth_date는 422 등)를 화면에 보여줄 수 있도록
+ * 에러를 삼키지 않고 그대로 던져요.
+ * 2026-08-19 백엔드 변경사항 문서로 birth_date(YYYY-MM-DD) 필드가 확정됐어요. */
+export async function apiUpdateMe(input: {
+  name?: string;
+  phone?: string | null;
+  profile_image_url?: string | null;
+  birth_date?: string | null;
+}): Promise<ApiUser> {
+  const res = await apiFetch<{ user: ApiUser }>("/api/users/me", {
+    method: "PUT",
+    body: input,
+    authAs: "customer",
+  });
+  return res.user;
+}
+
+/** POST /api/uploads/images — 이미지 업로드(프로필 사진 등 공용 업로드).
+ * 2026-08-19 백엔드 변경사항 문서로 응답 형식이 확정됐어요:
+ *   { "path": "blog/example.jpg", "url": "http://.../storage/blog/example.jpg" }
+ * 프론트에서는 이 url을 그대로 쓰면 돼요(이미 절대 주소라 resolveImageUrl도
+ * 그대로 통과시켜요). 혹시 모를 다른 응답 형태에 대비해 image_url/path 및
+ * data로 감싼 형태도 순서상 후순위로 계속 지원해요. */
+export async function apiUploadImage(
+  file: File,
+  authAs: AuthAs = "customer",
+): Promise<string | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const form = new FormData();
+    form.append("image", file);
+
+    const token =
+      authAs === "customer"
+        ? getCustomerToken()
+        : authAs === "owner"
+          ? getOwnerToken()
+          : null;
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const res = await fetch(`${API_BASE_URL}/api/uploads/images`, {
+      method: "POST",
+      headers,
+      body: form,
+    });
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "");
+      // eslint-disable-next-line no-console
+      console.error(
+        `[apiUploadImage] 업로드 실패 (${res.status} ${res.statusText}) authAs=${authAs} token=${token ? "있음" : "없음"}`,
+        bodyText,
+      );
+      return null;
+    }
+
+    const data = (await res.json().catch(() => null)) as Record<
+      string,
+      unknown
+    > | null;
+    if (!data) {
+      // eslint-disable-next-line no-console
+      console.error("[apiUploadImage] 응답 본문을 JSON으로 읽지 못했어요.");
+      return null;
+    }
+    const nested =
+      data["data"] && typeof data["data"] === "object"
+        ? (data["data"] as Record<string, unknown>)
+        : null;
+    const url =
+      data["url"] ??
+      data["image_url"] ??
+      data["path"] ??
+      nested?.["url"] ??
+      nested?.["image_url"];
+    if (typeof url !== "string") {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[apiUploadImage] 응답에서 이미지 URL 필드를 못 찾았어요. 실제 응답 형태를 확인해주세요:",
+        data,
+      );
+      return null;
+    }
+    return url;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[apiUploadImage] 네트워크 오류로 업로드에 실패했어요:", err);
+    return null;
+  }
+}
+
+/* ------------------------------ 카페(매장) 조회 ------------------------------ */
+
+/** GET /api/stores — 지도/검색 화면용 매장 목록 */
+export async function apiListStores(params?: {
+  keyword?: string;
+  reservation_available?: boolean;
+  tag?: string;
+}): Promise<ApiStore[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    return await apiFetch<ApiStore[]>("/api/stores", { query: params });
+  } catch {
+    return null;
+  }
+}
+
+export type ApiAvailability = {
+  store_id: number;
+  total_capacity: number;
+  occupied_capacity: number;
+  available_capacity: number;
+  occupancy_rate: number;
+  congestion: "UNAVAILABLE" | "NEAR_FULL" | "BUSY" | "NORMAL" | "RELAXED";
+  congestion_label: string;
+  reservation_enabled: boolean;
+  /** 좌석 현황이 마지막으로 갱신된 시각(ISO). 카페 상세/지도 카드의
+   * "n분 전 업데이트" 표시에 써요. */
+  availability_updated_at?: string | null;
+};
+
+/** GET /api/stores/{store}/congestion — 매장의 실시간 좌석 가용성(혼잡도)만 조회.
+ * 지도/검색처럼 여러 매장을 한 번에 불러온 뒤, 매장별 혼잡도를 별도로 채워 넣을 때 써요. */
+export async function apiGetStoreCongestion(
+  storeId: string | number,
+): Promise<ApiAvailability | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    return await apiFetch<ApiAvailability>(
+      `/api/stores/${encodeURIComponent(String(storeId))}/congestion`,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** GET /api/stores/{store} — 카페 상세 + 실시간 좌석 가용성 */
+export async function apiGetStore(
+  storeId: string | number,
+): Promise<{ store: ApiStore; availability: ApiAvailability } | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    return await apiFetch(`/api/stores/${encodeURIComponent(String(storeId))}`);
+  } catch {
+    return null;
+  }
+}
+
+/** GET /api/stores/{store}/menus — 손님용 카페 상세 화면의 "메뉴" 탭에서 사용.
+ * 사장님 전용(/api/owner/stores/{store}/menus)과 별개의 공개 엔드포인트예요.
+ * 응답 형태가 스웨거에 명세돼 있지 않아서, 흔히 쓰이는 형태들을 순서대로 시도해요. */
+export async function apiGetStoreMenus(
+  storeId: string | number,
+): Promise<ApiMenu[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<unknown>(
+      `/api/stores/${encodeURIComponent(String(storeId))}/menus`,
+    );
+    if (Array.isArray(res)) return res as ApiMenu[];
+    if (res && typeof res === "object") {
+      const obj = res as Record<string, unknown>;
+      if (Array.isArray(obj["data"])) return obj["data"] as ApiMenu[];
+      const menus = obj["menus"] as Record<string, unknown> | undefined;
+      if (menus && Array.isArray(menus["data"]))
+        return menus["data"] as ApiMenu[];
+    }
+    return [];
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------------------------- 찜(favorite) ---------------------------------- */
+
+/** POST /api/stores/{store}/favorite */
+export async function apiFavoriteStore(
+  storeId: string | number,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(
+      `/api/stores/${encodeURIComponent(String(storeId))}/favorite`,
+      {
+        method: "POST",
+        authAs: "customer",
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** DELETE /api/stores/{store}/favorite */
+export async function apiUnfavoriteStore(
+  storeId: string | number,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(
+      `/api/stores/${encodeURIComponent(String(storeId))}/favorite`,
+      {
+        method: "DELETE",
+        authAs: "customer",
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** GET /api/users/me/favorites — 찜한 매장 id 목록을 뽑아내요. */
+export async function apiGetMyFavoriteStoreIds(): Promise<string[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<unknown>("/api/users/me/favorites", {
+      authAs: "customer",
+    });
+    const rows: Array<Record<string, unknown>> = Array.isArray(res)
+      ? res
+      : res &&
+          typeof res === "object" &&
+          Array.isArray((res as { data?: unknown }).data)
+        ? (res as { data: Array<Record<string, unknown>> }).data
+        : [];
+    return rows
+      .map((r) => r["store_id"] ?? r["id"])
+      .filter((v): v is string | number => v !== undefined && v !== null)
+      .map((v) => String(v));
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------------------------- 리뷰 ---------------------------------- */
+
+export type ApiReview = {
+  id: number;
+  user_id: number;
+  store_id: number;
+  rating: number;
+  content: string;
+  created_at: string;
+};
+
+/** GET /api/stores/{store}/reviews */
+export async function apiGetStoreReviews(
+  storeId: string | number,
+): Promise<ApiReview[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<{ data: ApiReview[] }>(
+      `/api/stores/${encodeURIComponent(String(storeId))}/reviews`,
+    );
+    return res.data ?? [];
+  } catch {
+    return null;
+  }
+}
+
+/** POST /api/stores/{store}/reviews — 등록된 리뷰(서버 id 포함)를 그대로 돌려줘요.
+ * 이 id가 있어야 나중에 PUT/DELETE /api/reviews/{review} 로 수정·삭제할 수 있어요. */
+export async function apiCreateReview(
+  storeId: string | number,
+  input: {
+    rating: number;
+    content: string;
+    order_id?: number;
+    reservation_id?: number;
+  },
+): Promise<ApiReview | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<{ review?: ApiReview } | ApiReview>(
+      `/api/stores/${encodeURIComponent(String(storeId))}/reviews`,
+      { method: "POST", body: input, authAs: "customer" },
+    );
+    if (res && typeof res === "object" && "review" in res && res.review)
+      return res.review;
+    if (res && typeof res === "object" && "id" in res) return res as ApiReview;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** PUT /api/reviews/{review} */
+export async function apiUpdateReview(
+  reviewId: string | number,
+  input: { rating: number; content: string },
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/reviews/${encodeURIComponent(String(reviewId))}`, {
+      method: "PUT",
+      body: input,
+      authAs: "customer",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** DELETE /api/reviews/{review} */
+export async function apiDeleteReview(
+  reviewId: string | number,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/reviews/${encodeURIComponent(String(reviewId))}`, {
+      method: "DELETE",
+      authAs: "customer",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* --------------------------------- 혜택(포인트/쿠폰) --------------------------------- */
+
+/** GET /api/users/me/coupons */
+export async function apiGetMyCoupons(): Promise<Array<
+  Record<string, unknown>
+> | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<unknown>("/api/users/me/coupons", {
+      authAs: "customer",
+    });
+    if (Array.isArray(res)) return res;
+    if (
+      res &&
+      typeof res === "object" &&
+      Array.isArray((res as { data?: unknown }).data)
+    ) {
+      return (res as { data: Array<Record<string, unknown>> }).data;
+    }
+    return [];
+  } catch {
+    return null;
+  }
+}
+
+/** GET /api/users/me/membership — 포인트 등 멤버십 정보 */
+export async function apiGetMyMembership(): Promise<Record<
+  string,
+  unknown
+> | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    return await apiFetch<Record<string, unknown>>("/api/users/me/membership", {
+      authAs: "customer",
+    });
+  } catch {
+    return null;
+  }
+}
+
+/* ------------------------------ 주문 힌트 캐시 ------------------------------ */
+/**
+ * 주문 목록/상세 응답에 결제 금액(total_amount)이나 손님 프로필 사진이 비어서
+ * 오는 문제(스웨거에 응답 스키마가 없어서 서버가 실제로 어떤 필드를 채워
+ * 주는지 확정할 수 없어요)를 보완하기 위한 "같은 브라우저 안에서만 쓰는" 보정
+ * 캐시예요. 주문을 만든 바로 그 화면(결제 화면)은 장바구니에 담긴 메뉴
+ * 이름/가격/수량과 최종 결제 금액을 이미 정확히 알고 있으니, 주문 생성 직후
+ * 그 값을 orderId 기준으로 저장해두고, 이후 그 주문을 다시 조회할 때 서버
+ * 응답에 값이 없으면(0원 등) 이 캐시로 채워요.
+ * ⚠️ 사장님 화면은 손님과 다른 브라우저/기기라서 이 캐시를 공유하지 못해요.
+ * 그래서 손님 프로필 사진처럼 "사장님 화면에서만 보이면 되는" 값은 이 캐시로
+ * 완전히 해결되지 않고, 서버 응답 자체에 해당 필드가 내려와야만 보여요
+ * (parseOrder의 넓은 후보 필드명 탐색이 그 역할이에요).
+ */
+export type OrderHint = {
+  amount: number;
+  items: { name: string; quantity: number; price: number }[];
+};
+
+function orderHintKey(orderId: string | number) {
+  return `cafeon_order_hint_${orderId}`;
+}
+
+export function setOrderHint(orderId: string | number, hint: OrderHint) {
+  writeStorage(orderHintKey(orderId), JSON.stringify(hint));
+}
+
+function getOrderHint(orderId: string | number): OrderHint | null {
+  const raw = readStorage(orderHintKey(orderId));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as OrderHint;
+    if (typeof parsed?.amount === "number" && Array.isArray(parsed.items)) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** 토스 결제창으로 넘어가는 동안(성공/실패 페이지로 브라우저가 완전히
+ * 새로고침돼요) 손님/장바구니 React 상태가 전부 초기화되니, 결제창을 열기
+ * 직전에 "이 결제가 어떤 주문/금액/매장이었는지"를 로컬에 잠깐 저장해두고,
+ * 결제 성공 페이지가 돌아와서 이 값을 읽어 결제 승인 + 완료 화면 표시에 써요. */
+const PENDING_TOSS_PAYMENT_KEY = "cafeon_pending_toss_payment";
+
+export type PendingTossPayment = {
+  tossOrderId: string;
+  orderId: string;
+  amount: number;
+  cafeName: string;
+  items: { name: string; quantity: number; price: number }[];
+};
+
+export function setPendingTossPayment(payment: PendingTossPayment) {
+  writeStorage(PENDING_TOSS_PAYMENT_KEY, JSON.stringify(payment));
+}
+
+export function getPendingTossPayment(): PendingTossPayment | null {
+  const raw = readStorage(PENDING_TOSS_PAYMENT_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as PendingTossPayment;
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingTossPayment() {
+  writeStorage(PENDING_TOSS_PAYMENT_KEY, null);
+}
+
+/* -------------------------------- 주문 · 결제(테스트) -------------------------------- */
+/**
+ * ⚠️ 지금 단계는 "결제가 실제로 되는지"가 아니라 "주문 → 결제창 → 완료" 흐름이
+ * 화면과 API에 자연스럽게 이어지는지가 목적이라, 결제 승인은 진짜 카드 결제창
+ * (토스 SDK)을 띄우지 않고 앱 안에서 결제창처럼 보이는 화면으로 대신해요.
+ * 대신 아래 세 함수는 실제 백엔드 엔드포인트(POST /api/orders,
+ * GET /api/payments/orders/{order}/checkout, POST /api/payments/confirm)를
+ * 그대로 호출해서, 나중에 진짜 토스 결제위젯으로 바꿔도 이 함수들의 시그니처는
+ * 그대로 재사용할 수 있게 해뒀어요.
+ * 요청/응답 스키마가 스웨거에 상세히 없어서(응답 200만 명시) 흔히 쓰는 필드명으로
+ * 보내고, 응답에서도 여러 후보 필드명을 순서대로 시도해요.
+ */
+
+export type ApiOrderItemInput = {
+  menu_id: number;
+  quantity: number;
+};
+
+export type ApiOrder = {
+  id: number;
+  store_id: number;
+  status?: string;
+  total_amount?: number;
+  point_used?: number;
+};
+
+/** POST /api/orders — 장바구니 내용을 주문으로 등록해요.
+ * point_used/user_coupon_id는 0819기능수정사항.txt에 나온 대로 별도 API 없이
+ * 주문 생성 시 함께 보내요. */
+/** apiCreateOrder가 null을 돌려준 "진짜 이유"를 호출부(체크아웃 화면)가 사람이
+ * 읽을 수 있는 메시지로 보여줄 수 있게 마지막 실패 사유를 기록해둬요.
+ * ⚠️ 이전 코드는 실패하면 원인(401/403/422 등 서버 응답이었는지, 아니면 200은
+ * 왔는데 우리가 기대한 필드가 없었는지)을 통째로 삼키고 항상 catch에서 null만
+ * 돌려줬어요. 그래서 화면엔 매번 "주문을 생성하지 못했어요. 네트워크나 서버
+ * 상태를 확인해주세요"라는 뭉뚱그린 문구만 떴고, 이번처럼 결제 시작 전(주문
+ * 생성 단계)부터 막히는 경우엔 원인 파악이 아예 불가능했어요. 이제 실제 실패
+ * 사유를 남기고, 서버가 준 응답 원본도 콘솔에 남겨요.
+ */
+export let lastCreateOrderError: string | null = null;
+
+export async function apiCreateOrder(input: {
+  store_id: number;
+  items: ApiOrderItemInput[];
+  point_used?: number;
+  user_coupon_id?: number;
+}): Promise<ApiOrder | null> {
+  lastCreateOrderError = null;
+  if (!isApiConfigured()) {
+    lastCreateOrderError = "백엔드 서버 주소(NEXT_PUBLIC_API_BASE_URL)가 설정돼 있지 않아요.";
+    return null;
+  }
+  try {
+    const res = await apiFetch<Record<string, unknown>>("/api/orders", {
+      method: "POST",
+      body: input,
+      authAs: "customer",
+    });
+    // eslint-disable-next-line no-console
+    console.debug("[주문 생성] 서버 응답 원본:", res);
+    const raw = (res?.["order"] as Record<string, unknown> | undefined) ?? res;
+    const id = raw?.["id"];
+    if (typeof id !== "number") {
+      lastCreateOrderError =
+        "주문 생성은 됐지만 응답에서 주문 id를 찾지 못했어요. 브라우저 콘솔의 " +
+        "'[주문 생성] 서버 응답 원본'을 확인해서 실제 필드명을 알려주시면 매칭시켜 드릴게요.";
+      return null;
+    }
+    return {
+      id,
+      store_id: Number(raw["store_id"] ?? input.store_id),
+      status: raw["status"] as string | undefined,
+      total_amount:
+        typeof raw["total_amount"] === "number"
+          ? (raw["total_amount"] as number)
+          : typeof raw["amount"] === "number"
+            ? (raw["amount"] as number)
+            : undefined,
+      point_used:
+        typeof raw["point_used"] === "number"
+          ? (raw["point_used"] as number)
+          : undefined,
+    };
+  } catch (err) {
+    if (err instanceof ApiError) {
+      const fieldMsg = err.fieldErrors
+        ? " " +
+          Object.entries(err.fieldErrors)
+            .map(([field, msgs]) => `${field}: ${msgs.join(", ")}`)
+            .join(" / ")
+        : "";
+      lastCreateOrderError = `주문 생성 요청이 서버에서 거부됐어요 (${err.status}): ${err.message}${fieldMsg}`;
+    } else {
+      lastCreateOrderError =
+        err instanceof Error ? err.message : "주문 생성 요청 중 알 수 없는 오류가 발생했어요.";
+    }
+    // eslint-disable-next-line no-console
+    console.error("[주문 생성] 실패:", err);
+    return null;
+  }
+}
+
+/** GET /api/payments/orders/{order}/checkout — 결제 준비.
+ * ⚠️ 진짜 원인: "결제 주문번호가 일치하지 않습니다"(422) — 프론트가
+ * `cafeon${orderId}${timestamp}` 같은 임의의 문자열을 스스로 만들어서 토스
+ * 결제창에도 쓰고 승인 요청에도 그대로 보내면, 서버가 이 주문에 대해 이미
+ * 발급/기록해둔 토스 주문번호와 다르다며 거부해요. 한 번 이 호출을 아예
+ * 빼버린 적이 있었는데(그 시점엔 이 API가 다른 이유로 실패하고 있었고, 그
+ * 원인을 못 밝힌 채로 걷어냈어요) — 그랬더니 정확히 이 "주문번호 불일치"
+ * 422가 재현됐어요. 즉 이 API는 선택이 아니라 필수예요: 결제창을 열기 전에
+ * 반드시 호출해서 서버가 발급한 토스 주문번호를 받아오고, 그 값을 토스
+ * 결제창과 이후 승인 요청 양쪽에 그대로 써야 해요.
+ * 스웨거에 응답 스키마가 없어서(성공 200만 명시), 흔히 쓰는 후보 필드명들을
+ * 순서대로 시도해서 서버가 발급한 토스 주문번호를 뽑아내요. 실패하면(이
+ * API 자체가 401/403/404/422/500을 주거나, 200인데 필드를 못 찾으면) 원인을
+ * lastPaymentCheckoutError에 남기고 응답 원본을 콘솔에 남겨서, 다음에 실패해도
+ * 이유를 바로 알 수 있게 해요. */
+export type ApiPaymentCheckout = {
+  tossOrderId: string;
+  amount: number | null;
+  clientKey: string | null;
+};
+
+export let lastPaymentCheckoutError: string | null = null;
+
+export async function apiGetPaymentCheckout(
+  orderId: string | number,
+): Promise<ApiPaymentCheckout | null> {
+  lastPaymentCheckoutError = null;
+  if (!isApiConfigured()) {
+    lastPaymentCheckoutError = "백엔드 서버 주소(NEXT_PUBLIC_API_BASE_URL)가 설정돼 있지 않아요.";
+    return null;
+  }
+  try {
+    const raw = await apiFetch<Record<string, unknown>>(
+      `/api/payments/orders/${encodeURIComponent(String(orderId))}/checkout`,
+      { authAs: "customer" },
+    );
+    // ⚠️ 응답 스키마가 문서화돼 있지 않아서, 실패하든 성공하든 원본을 그대로
+    // 콘솔에 남겨요. 성공했는데 필드를 못 찾는 경우 이 로그로 실제 필드명을
+    // 바로 확인할 수 있어요.
+    // eslint-disable-next-line no-console
+    console.debug("[결제 준비] 서버 응답 원본:", raw);
+
+    const payment =
+      (raw?.["payment"] as Record<string, unknown> | undefined) ??
+      (raw?.["data"] as Record<string, unknown> | undefined) ??
+      (raw?.["checkout"] as Record<string, unknown> | undefined) ??
+      raw;
+    const tossOrderId = pick<string>(payment, [
+      "toss_order_id",
+      "tossOrderId",
+      "toss_order_no",
+      "tossOrderNo",
+      "order_id",
+      "orderId",
+      "order_no",
+      "orderNo",
+      "merchant_uid",
+    ]);
+    if (!tossOrderId) {
+      lastPaymentCheckoutError =
+        "결제 준비 API는 성공(200)했지만 응답에서 토스 주문번호를 찾지 못했어요. 브라우저 " +
+        "콘솔에 찍힌 '[결제 준비] 서버 응답 원본'을 확인해서 실제 필드명을 알려주시면 " +
+        "매칭시켜 드릴게요.";
+      return null;
+    }
+    const amount = pick<number>(payment, ["amount", "total_amount"]);
+    const clientKey = pick<string>(payment, ["client_key", "clientKey"]);
+    return {
+      tossOrderId: String(tossOrderId),
+      amount: typeof amount === "number" ? amount : null,
+      clientKey: clientKey ?? null,
+    };
+  } catch (err) {
+    if (err instanceof ApiError) {
+      lastPaymentCheckoutError = `결제 준비 요청이 서버에서 거부됐어요 (${err.status}): ${err.message}`;
+    } else {
+      lastPaymentCheckoutError =
+        err instanceof Error ? err.message : "결제 준비 요청 중 알 수 없는 오류가 발생했어요.";
+    }
+    // eslint-disable-next-line no-console
+    console.error("[결제 준비] 실패:", err);
+    return null;
+  }
+}
+
+/** POST /api/payments/confirm — 결제 승인.
+ * 토스페이먼츠 결제위젯이 성공 시 돌려주는 paymentKey/orderId/amount 값을
+ * 백엔드에 전달해서 최종 승인하는 구조예요.
+ * ⚠️ 실제로 호출해서 받은 에러로 필드명을 확정해나간 이력:
+ * 1차: "The order id field is required. (and 2 more errors)" — orderId/
+ *      paymentKey(카멜케이스)를 서버가 아예 못 읽어서, 이 문서의 다른 모든
+ *      엔드포인트처럼 스네이크케이스(order_id/payment_key)로 바꿈.
+ * 2차: "The toss order id field is required." (단일 에러) — order_id/amount/
+ *      payment_key는 통과했지만, 서버는 우리 내부 DB의 주문 번호(order_id)가
+ *      아니라 "토스 결제창에 실제로 넘겼던 그 주문번호"(toss_order_id, 예:
+ *      cafeon123abc...)를 별도로 요구했어요. 그동안 그 값을 아예 안 보내고
+ *      있었어요. 그래서 toss_order_id 필드를 추가하고, 거기에 checkout
+ *      화면이 토스에 넘겼던 문자열(pendingTossPayment.tossOrderId)을 그대로
+ *      실어 보내요. order_id(내부 숫자 id)는 계속 함께 보내요 — 이전 호출까지
+ *      통과했던 필드라 굳이 뺄 이유가 없어요. */
+export async function apiConfirmPayment(input: {
+  orderId: string | number;
+  tossOrderId: string;
+  amount: number;
+  paymentKey?: string;
+}): Promise<{ ok: boolean; status?: number; message?: string }> {
+  if (!isApiConfigured()) return { ok: false };
+  try {
+    const numericOrderId = Number(input.orderId);
+    await apiFetch("/api/payments/confirm", {
+      method: "POST",
+      body: {
+        order_id: Number.isFinite(numericOrderId) ? numericOrderId : input.orderId,
+        toss_order_id: input.tossOrderId,
+        amount: input.amount,
+        payment_key: input.paymentKey ?? `demo_${Date.now()}`,
+      },
+      authAs: "customer",
+    });
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof ApiError) {
+      return { ok: false, status: err.status, message: err.message };
+    }
+    return { ok: false, message: err instanceof Error ? err.message : undefined };
+  }
+}
+
+/** 주문 1건에 담긴 메뉴 한 줄. 목록/상세 응답 모두 스웨거에 필드 스키마가 없어서
+ * (성공 200만 명시) 흔히 쓰는 후보 필드명을 순서대로 시도해서 채워요. */
+export type ApiOrderItemDetail = {
+  menuId: number | null;
+  name: string;
+  quantity: number;
+  price: number;
+};
+
+/** 손님 화면(주문내역)에서 쓰는 주문 1건. status는 서버가 실제로 내려주는 값을
+ * 그대로 담아두고(예: PENDING/PREPARING/READY/COMPLETED/CANCELLED 등으로 추정),
+ * 화면에서 알려진 값이면 배지 문구로 바꾸고 모르는 값이어도 그 문자열을 그대로
+ * 보여줘서 화면이 깨지지 않게 해요. */
+export type ApiOrderDetail = {
+  id: number;
+  storeId: number | null;
+  storeName: string | null;
+  /** 사장님 화면(주문 목록)에서만 의미 있는 값이에요. 손님 본인 주문 조회
+   * 응답에는 보통 없거나 본인 이름이라 화면에서 굳이 안 써요. */
+  customerName: string | null;
+  /** 주문한 손님이 자기 프로필에 등록한 사진(ApiUser.profile_image_url과 동일한
+   * 값). 사장님 화면(최근 주문/주문 목록/상세)에서 회색 아이콘 대신 실제 손님
+   * 사진을 보여줄 때 써요. resolveImageUrl로 이미 절대 URL로 변환돼 있어서
+   * ImagePlaceholder의 src에 바로 넣으면 돼요(없으면 null → 자동 폴백). */
+  customerImageUrl: string | null;
+  status: string;
+  totalAmount: number;
+  pointUsed: number;
+  createdAt: string | null;
+  items: ApiOrderItemDetail[];
+};
+
+/** 여러 후보 필드명 중 처음으로 발견되는 값을 돌려줘요(스웨거에 응답 스키마가
+ * 없는 엔드포인트가 많아서 목록/상세 파싱에서 공통으로 재사용해요). */
+function pick<T = unknown>(raw: Record<string, unknown>, keys: string[]): T | undefined {
+  for (const k of keys) {
+    if (raw[k] !== undefined && raw[k] !== null) return raw[k] as T;
+  }
+  return undefined;
+}
+
+function parseOrderItem(raw: Record<string, unknown>): ApiOrderItemDetail {
+  const menu = pick<Record<string, unknown>>(raw, ["menu"]);
+  const quantity = Number(pick(raw, ["quantity", "qty", "count"]) ?? 1);
+  const unitPrice = Number(
+    pick(raw, ["price", "unit_price", "menu_price"]) ?? (menu ? pick(menu, ["price"]) : undefined) ?? 0
+  );
+  return {
+    menuId: (() => {
+      const id = pick<number>(raw, ["menu_id"]) ?? (menu ? pick<number>(menu, ["id"]) : undefined);
+      return typeof id === "number" ? id : null;
+    })(),
+    name:
+      pick<string>(raw, ["menu_name", "name"]) ??
+      (menu ? pick<string>(menu, ["name"]) : undefined) ??
+      "메뉴",
+    quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 1,
+    price: Number.isFinite(unitPrice) ? unitPrice : 0,
+  };
+}
+
+function parseOrder(raw: Record<string, unknown>): ApiOrderDetail {
+  const store = pick<Record<string, unknown>>(raw, ["store"]);
+  const user = pick<Record<string, unknown>>(raw, ["user", "customer", "buyer", "orderer"]);
+  const itemsRaw = pick<unknown[]>(raw, ["items", "order_items", "orderItems"]) ?? [];
+  const id = Number(pick(raw, ["id"]) ?? 0);
+  const storeId = pick<number>(raw, ["store_id"]) ?? (store ? pick<number>(store, ["id"]) : undefined);
+
+  // ⚠️ 결제 금액/메뉴 구성이 0원·빈 값으로 오는 문제 보정: 이 브라우저에서 방금
+  // 만든 주문이면(orderHintKey) 결제 화면이 이미 알고 있던 정확한 금액/구성으로
+  // 채워요. 서버 응답에 실제 값이 있으면 그 값을 그대로 쓰고, 캐시는 "없을 때만" 써요.
+  const hint = id ? getOrderHint(id) : null;
+  let totalAmount = Number(pick(raw, ["total_amount", "amount"]) ?? 0);
+  let items = Array.isArray(itemsRaw)
+    ? itemsRaw.map((it) => parseOrderItem(it as Record<string, unknown>))
+    : [];
+  if ((!totalAmount || Number.isNaN(totalAmount)) && hint) {
+    totalAmount = hint.amount;
+  }
+  if ((items.length === 0 || items.every((it) => !it.price)) && hint?.items?.length) {
+    items = hint.items.map((h, idx) => ({
+      menuId: items[idx]?.menuId ?? null,
+      name: h.name,
+      quantity: h.quantity,
+      price: h.price,
+    }));
+  }
+
+  return {
+    id,
+    storeId: typeof storeId === "number" ? storeId : null,
+    storeName: pick<string>(raw, ["store_name"]) ?? (store ? pick<string>(store, ["name"]) : undefined) ?? null,
+    customerName:
+      pick<string>(raw, ["customer_name", "user_name"]) ??
+      (user ? pick<string>(user, ["name"]) : undefined) ??
+      null,
+    // ⚠️ 주문 목록/상세 응답 스키마가 스웨거에 없어서(성공 200만 명시), 손님
+    // 프로필(ApiUser)과 같은 후보 필드명들(profile_image_url 우선)을 최대한
+    // 넓게 순서대로 시도해요. user/customer 객체 안, 최상위 raw 둘 다 찾아봐요.
+    // ⚠️ 그래도 안 뜨면 필드명이 안 맞아서가 아니라, 이 목록 API 응답 자체에
+    // 손님 관계(user/customer)가 아예 포함 안 돼 있을 가능성이 커요 — 그땐
+    // 실제 응답 JSON을 확인해서 정확한 키로 다시 맞춰야 해요.
+    customerImageUrl: resolveImageUrl(
+      (user
+        ? pick<string>(user, [
+            "profile_image_url",
+            "profileImageUrl",
+            "image_url",
+            "imageUrl",
+            "avatar_url",
+            "avatarUrl",
+            "photo_url",
+            "photoUrl",
+          ])
+        : undefined) ??
+        pick<string>(raw, [
+          "customer_image_url",
+          "customerImageUrl",
+          "profile_image_url",
+          "user_profile_image_url",
+        ])
+    ),
+    status: String(pick(raw, ["status"]) ?? "PENDING"),
+    totalAmount,
+    pointUsed: Number(pick(raw, ["point_used"]) ?? 0),
+    createdAt: pick<string>(raw, ["created_at"]) ?? null,
+    items,
+  };
+}
+
+/** GET /api/users/me/orders — 손님 본인의 주문 내역 전체 조회. */
+export async function apiGetMyOrders(): Promise<ApiOrderDetail[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<unknown>("/api/users/me/orders", { authAs: "customer" });
+    const rows = Array.isArray(res)
+      ? res
+      : (res as { data?: unknown[] })?.data ?? [];
+    return Array.isArray(rows) ? rows.map((r) => parseOrder(r as Record<string, unknown>)) : [];
+  } catch {
+    return null;
+  }
+}
+
+/** GET /api/users/me/orders/{order} — 주문 1건 상세(메뉴 구성 포함) 조회. */
+export async function apiGetMyOrderDetail(id: string | number): Promise<ApiOrderDetail | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<Record<string, unknown>>(
+      `/api/users/me/orders/${encodeURIComponent(String(id))}`,
+      { authAs: "customer" }
+    );
+    const raw = (res?.["order"] as Record<string, unknown> | undefined) ?? res;
+    return parseOrder(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** POST /api/users/me/orders/{order}/cancel — 주문 취소(매장이 아직 접수 전일 때만
+ * 서버가 허용할 것으로 예상돼요. 서버가 422로 거절하면 false를 돌려줘서, 호출한
+ * 쪽에서 "이미 준비 중이라 취소할 수 없어요" 같은 안내를 보여줄 수 있어요). */
+export async function apiCancelMyOrder(id: string | number): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/users/me/orders/${encodeURIComponent(String(id))}/cancel`, {
+      method: "POST",
+      authAs: "customer",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* ===================================================================== */
+/* 사장님(오너) 전용 API                                                    */
+/* ===================================================================== */
+
+export type TodaySalesResponse = {
+  /** 오늘 09시부터 현재 시간대까지, 시간대별 "누적" 매출액 */
+  hourly: SalesPoint[];
+  /** 어제 하루 총 매출액 (전일 대비 증감률 계산용) */
+  yesterdayTotal: number;
+};
+
+/**
+ * 사장님 홈 화면의 "오늘 매출" 카드 + 그래프에 쓰일 데이터를 가져와요.
+ *
+ * 실제 백엔드에는 "오늘 매출"만 딱 주는 전용 엔드포인트가 없어서, 두 엔드포인트를
+ * 조합해서 만들어요:
+ *  - GET /api/owner/stores/{store}/dashboard 의 `sales`(시간대별 누적 매출)와
+ *    `sales_meta.hours`(각 포인트가 몇 시인지)를 그래프 포인트로 변환해요.
+ *    2026-08-19 백엔드 변경사항 문서로 sales_meta가 추가돼서, 더 이상 09시부터
+ *    라고 추측하지 않고 실제 hours 배열을 그대로 X축에 써요.
+ *  - GET /api/owner/stores/{store}/sales?from=어제&to=어제 의
+ *    summary.total_sales 를 전일 총 매출로 사용해요.
+ */
+export async function fetchTodaySales(
+  storeId: string | number,
+): Promise<TodaySalesResponse | null> {
+  if (!isApiConfigured()) return null;
+
+  try {
+    const [dashboard, yesterday] = await Promise.all([
+      apiFetch<{
+        sales: number[];
+        sales_meta?: { hours?: number[] };
+      }>(`/api/owner/stores/${encodeURIComponent(String(storeId))}/dashboard`, {
+        authAs: "owner",
+      }),
+      (() => {
+        const d = new Date();
+        d.setDate(d.getDate() - 1);
+        const iso = d.toISOString().slice(0, 10);
+        return apiFetch<{ summary: { total_sales: number } }>(
+          `/api/owner/stores/${encodeURIComponent(String(storeId))}/sales`,
+          { authAs: "owner", query: { from: iso, to: iso } },
+        );
+      })(),
+    ]);
+
+    const sales = dashboard.sales ?? [];
+    // sales_meta.hours가 있으면 그대로 쓰고(백엔드가 실제 시간대를 알려줌),
+    // 혹시 없는 옛 응답이 오더라도 09시부터 순서대로라고 가정해 화면이 안 깨지게 해요.
+    const hours = dashboard.sales_meta?.hours ?? sales.map((_, i) => 9 + i);
+    const hourly: SalesPoint[] = sales.map((amount, i) => ({
+      hour: String(hours[i] ?? 9 + i).padStart(2, "0"),
+      amount,
+    }));
+
+    return {
+      hourly,
+      yesterdayTotal: yesterday.summary?.total_sales ?? 0,
+    };
+  } catch (err) {
+    console.warn("[sales] 매출 데이터를 불러오지 못했어요.", err);
+    return null;
+  }
+}
+
+export type ApiMenu = {
+  id: number;
+  store_id: number;
+  category_id: number | null;
+  /** 카테고리 이름. 서버가 문자열로 함께 내려주면 이 필드로 와요(없으면 undefined). */
+  category?: string | null;
+  name: string;
+  description?: string | null;
+  price: string;
+  image_url?: string | null;
+  is_available: boolean;
+};
+
+/** GET /api/owner/menus — "사장님 운영정보 재로그인 복원" 문서(섹션 11-3)로 확정된 경로.
+ * ⚠️ 예전엔 `/api/owner/stores/{store}/menus`를 썼는데, 그 경로는 이 문서
+ * 어디에도 정의돼 있지 않은(존재하지 않는) 엔드포인트였어요. 그래서 메뉴를
+ * 추가해도 서버에는 저장되지 않고(호출은 조용히 실패 → catch에서 null 반환),
+ * 화면에만 임시로 붙어 있다가 로그아웃 후 재로그인하면(=목록을 다시 불러오면)
+ * 사라지는 것처럼 보였어요. 이 경로는 storeId를 안 받고, 로그인한 사장님
+ * 계정의 활성 OWNER 매장을 서버가 토큰으로 자동 선택해요. */
+export async function apiOwnerListMenus(): Promise<ApiMenu[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<unknown>("/api/owner/menus", {
+      authAs: "owner",
+    });
+    if (Array.isArray(res)) return res as ApiMenu[];
+    if (res && typeof res === "object") {
+      const obj = res as Record<string, unknown>;
+      if (Array.isArray(obj["data"])) return obj["data"] as ApiMenu[];
+      const menus = obj["menus"] as Record<string, unknown> | undefined;
+      if (menus && Array.isArray(menus["data"]))
+        return menus["data"] as ApiMenu[];
+    }
+    return [];
+  } catch {
+    return null;
+  }
+}
+
+/** POST /api/owner/menus — 문서(섹션 11-3)로 확정된 경로.
+ * category_id 대신 category(예: "커피")를 문자열로 보내면 서버가 해당 매장의
+ * 카테고리를 찾아 자동으로 연결해줘요(카테고리를 미리 안 만들어도 됨). */
+export async function apiOwnerCreateMenu(input: {
+  name: string;
+  price: number;
+  category?: string | null;
+  description?: string | null;
+  image_url?: string | null;
+  is_available?: boolean;
+}): Promise<ApiMenu | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<{ menu?: ApiMenu; data?: ApiMenu }>(
+      "/api/owner/menus",
+      { method: "POST", body: input, authAs: "owner" },
+    );
+    return res.menu ?? res.data ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** POST /api/owner/menu-categories — 카테고리 생성(문서 섹션 11-3).
+ * ⚠️ apiOwnerCreateMenu에 category(이름 문자열)를 보내면 서버가 "해당 매장의
+ * 카테고리를 찾아" 연결하는 방식이라, 그 매장에 아직 그 이름의 카테고리가 하나도
+ * 없으면(특히 매장을 막 만든 직후) 못 찾아서 메뉴 생성 자체가 실패해요. 이때
+ * apiOwnerCreateMenu는 실패를 조용히 삼키고 null만 돌려줘서(호출부 어디서도
+ * 예외를 안 던지는 설계), 화면엔 메뉴가 추가된 것처럼 보이지만(낙관적 업데이트)
+ * 실제로는 저장되지 않고, 로그아웃 후 재로그인(=목록 다시 불러오기)하면 사라지는
+ *것처럼 보였어요. 이 함수로 카테고리를 먼저 만들어두면 그 문제를 막을 수 있어요.
+ * 이미 같은 이름의 카테고리가 있어서 이 호출이 실패해도(중복 등) 문제 없어요 —
+ * 어차피 그 경우엔 카테고리가 이미 있다는 뜻이라 메뉴 생성 재시도가 성공해요. */
+export async function apiOwnerCreateMenuCategory(
+  name: string,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch("/api/owner/menu-categories", {
+      method: "POST",
+      body: { name },
+      authAs: "owner",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** PUT /api/owner/menus/{menu} */
+export async function apiOwnerUpdateMenu(
+  menuId: string | number,
+  input: Partial<{
+    name: string;
+    price: number;
+    category: string | null;
+    category_id: number | null;
+    description: string | null;
+    image_url: string | null;
+    is_available: boolean;
+  }>,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/owner/menus/${encodeURIComponent(String(menuId))}`, {
+      method: "PUT",
+      body: input,
+      authAs: "owner",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** DELETE /api/owner/menus/{menu} */
+export async function apiOwnerDeleteMenu(
+  menuId: string | number,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/owner/menus/${encodeURIComponent(String(menuId))}`, {
+      method: "DELETE",
+      authAs: "owner",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** PATCH /api/owner/menus/{menu}/availability */
+export async function apiOwnerSetMenuAvailability(
+  menuId: string | number,
+  isAvailable: boolean,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(
+      `/api/owner/menus/${encodeURIComponent(String(menuId))}/availability`,
+      {
+        method: "PATCH",
+        body: { is_available: isAvailable },
+        authAs: "owner",
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** GET /api/owner/stores/{store}/orders — 사장님 화면에서 매장 주문 목록 조회.
+ * ⚠️ 메뉴·좌석과 달리 이 경로는 storeId를 URL에 그대로 넣어야 해요(스웨거 기준
+ * /api/owner/stores/{store}/orders). ownerStoreId가 없으면 호출하지 않아요. */
+export async function apiOwnerListStoreOrders(
+  storeId: string | number,
+): Promise<ApiOrderDetail[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<unknown>(
+      `/api/owner/stores/${encodeURIComponent(String(storeId))}/orders`,
+      { authAs: "owner" },
+    );
+    const rows = Array.isArray(res) ? res : (res as { data?: unknown[] })?.data ?? [];
+    return Array.isArray(rows) ? rows.map((r) => parseOrder(r as Record<string, unknown>)) : [];
+  } catch {
+    return null;
+  }
+}
+
+/** 상태값 하나당 서버가 실제로 받아줄 만한 후보 문자열들. 스웨거에 enum이
+ * 없어서(422 "상태 검증 실패"만 명시) 정확한 값을 확정할 수 없어요. 예약 상태
+ * API가 "ACCEPTED/APPROVED/수락/승인"도 CONFIRMED로 알아서 바꿔주는 것처럼
+ * 이 백엔드는 동의어를 넓게 받아주는 편이라, 대표값이 422로 거절되면 흔한
+ * 동의어로 한 번 더 시도해요.
+ * ⚠️ 주문 상세 응답(예: GET /api/owner/stores/{store}/orders)에 paid_at /
+ * preparing_at / ready_at / completed_at / cancelled_at / refunded_at 같은
+ * 타임스탬프 컬럼이 있고 confirmed_at/accepted_at/rejected_at 컬럼은 없는 걸로
+ * 봐서, 실제 enum은 예약(reservations) 쪽과 달리 CONFIRMED/ACCEPTED 단계 없이
+ * 바로 PREPARING으로, 거절은 REJECTED 없이 바로 CANCELLED로 넘어갈 가능성이
+ * 커요. 그래서 그 값들을 각 후보 목록의 맨 앞으로 두되, 확실하지 않으니 기존
+ * 후보들도 계속 순서대로 시도해요. 그래도 전부 422로 실패하면(=이 목록에 진짜
+ * 값이 없다는 뜻) 정확한 enum은 백엔드 소스코드(OrderStatus 관련 enum/상수)를
+ * 직접 확인해야 알 수 있어요 — 스웨거/전달받은 변경사항 문서 어디에도 이
+ * 엔드포인트의 상태값 목록이 명시돼 있지 않아요. */
+const ORDER_STATUS_CANDIDATES: Record<string, string[]> = {
+  CONFIRMED: ["PREPARING", "CONFIRMED", "ACCEPTED", "APPROVED"],
+  REJECTED: ["CANCELLED", "REJECTED", "DECLINED"],
+  READY: ["READY", "PREPARED", "COMPLETED"],
+  COMPLETED: ["COMPLETED", "DONE", "PICKED_UP"],
+  CANCELLED: ["CANCELLED", "CANCELED", "REJECTED"],
+};
+
+/** PATCH /api/owner/orders/{order}/status — 사장님이 주문 상태를 바꿔요
+ * (접수/준비완료/취소 등). 정확한 상태값 목록이 스웨거에 없어서, 예약 상태값과
+ * 비슷한 체계(대문자 스네이크)로 추정해서 보내고, 422(상태 검증 실패)가 오면
+ * 흔한 동의어로 재시도해요. ⚠️ 이 요청이 실제로 성공해야만 사장님이 로그아웃 후
+ * 다시 들어와도 상태가 유지돼요 — 실패했는데도 화면만 바뀐 것처럼 보이면
+ * (예전 방식: 결과를 확인 안 하고 그냥 fire-and-forget), 재로그인 시 서버에
+ * 남아있는 원래 상태(예: 주문접수)로 되돌아온 것처럼 보이는 문제가 생겨요. */
+export async function apiOwnerUpdateOrderStatus(
+  orderId: string | number,
+  status: "CONFIRMED" | "PREPARING" | "READY" | "COMPLETED" | "REJECTED" | "CANCELLED",
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  const candidates = ORDER_STATUS_CANDIDATES[status] ?? [status];
+  for (const candidate of candidates) {
+    try {
+      await apiFetch(`/api/owner/orders/${encodeURIComponent(String(orderId))}/status`, {
+        method: "PATCH",
+        body: { status: candidate },
+        authAs: "owner",
+      });
+      return true;
+    } catch (err) {
+      // 422(상태 검증 실패)면 다음 후보로 재시도하고, 그 외 오류(인증/권한/네트워크)면
+      // 재시도해도 어차피 안 되니 바로 포기해요.
+      if (err instanceof ApiError && err.status === 422) continue;
+      return false;
+    }
+  }
+  // eslint-disable-next-line no-console
+  console.error(
+    `[apiOwnerUpdateOrderStatus] 주문 #${orderId}: "${status}"로 시도한 후보값(${candidates.join(
+      ", ",
+    )}) 전부 422로 거절됐어요. 이 주문이 이미 취소/완료된 상태이거나(먼저 GET .../orders로 현재 status를 확인해보세요), 이 목록에 실제 enum 값이 없을 수 있어요 — 백엔드에 이 엔드포인트가 실제로 받는 status 값을 문의해주세요.`,
+  );
+  return false;
+}
+
+/** POST /api/owner/reviews/{review}/reply */
+export async function apiOwnerReplyToReview(
+  reviewId: string | number,
+  content: string,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(
+      `/api/owner/reviews/${encodeURIComponent(String(reviewId))}/reply`,
+      {
+        method: "POST",
+        body: { content },
+        authAs: "owner",
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** PATCH /api/owner/stores/{store}/business-status — 매장 영업중/영업마감 상태 변경.
+ * 2026-08-19 백엔드 변경사항 문서로 필드명이 확정됐어요: is_open.
+ * (예전 PATCH .../availability + is_active 방식은 당분간 계속 동작하지만,
+ * store.is_active(매장 게시·활성 여부)와 store.is_open(현재 영업 중 여부)은
+ * 서로 다른 개념이라 신규 코드는 여기(is_open)를 써야 해요.) */
+export async function apiOwnerUpdateBusinessStatus(
+  storeId: string | number,
+  isOpen: boolean,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(
+      `/api/owner/stores/${encodeURIComponent(String(storeId))}/business-status`,
+      {
+        method: "PATCH",
+        body: { is_open: isOpen },
+        authAs: "owner",
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 매장 프로필(이름/설명/주소/전화/대표이미지 등) 수정.
+ * 2026-08-19 백엔드 변경사항 문서로 확정됐어요: PATCH /api/owner/stores/{store}.
+ * 응답은 { message, store }로 오므로, 저장 직후 서버가 실제로 반영한 값을
+ * 그대로 돌려줘서 화면 상태를 서버와 동기화할 수 있게 해요(추측으로 로컬 상태만
+ * 유지하지 않아도 돼요). */
+export async function apiOwnerUpdateStoreProfile(
+  storeId: string | number,
+  input: Partial<{
+    name: string;
+    description: string | null;
+    address: string | null;
+    detail_address: string | null;
+    phone: string | null;
+    thumbnail_url: string | null;
+    latitude: number;
+    longitude: number;
+    reservation_enabled: boolean;
+    /** 2026-08-19 백엔드 변경사항 문서로 추가됨. 보낼 때는 알고 있는 필드만 채워서
+     * 보내요(사업자등록번호만 입력하는 화면이라도 나머지 필드는 undefined로 두면
+     * 서버에서 기존 값을 덮어쓰지 않아요 — PATCH이므로 부분 수정이에요). */
+    business_info: ApiStoreBusinessInfo;
+    /** 요일별 영업시간 전체 배열. tags와 마찬가지로 보내면 해당 매장의 영업시간
+     * 전체가 이 값으로 동기화돼요(부분 요일만 보내면 안 돼요). */
+    business_hours: ApiStoreBusinessHour[];
+    /** 2026-08-19 백엔드 변경사항 문서로 확정됨: 매장 태그 전체 목록.
+     * ⚠️ 예전엔 POST /api/stores/{store}/tags(태그 1개 추가) / DELETE /api/tags/{tag}
+     * (태그 1개 삭제) 전용 엔드포인트가 있는 줄 알고 그걸 썼는데, 실제로는 그런
+     * 엔드포인트가 없어서(404) 태그를 누르면 화면에 잠깐 붙었다가 실패 처리로
+     * 다시 사라지는 문제가 있었어요. 태그는 여기(PATCH .../stores/{store})로
+     * "현재 선택된 태그 전체 배열"을 보내면 서버가 그 값으로 통째로 동기화해요
+     * (부분 태그만 보내면 안 되고 항상 전체 목록을 보내야 해요).
+     */
+    tags: Array<{ name: string; slug?: string }>;
+  }>,
+): Promise<ApiStore | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<{ message: string; store: ApiStore }>(
+      `/api/owner/stores/${encodeURIComponent(String(storeId))}`,
+      { method: "PATCH", body: input, authAs: "owner" },
+    );
+    return res.store;
+  } catch {
+    return null;
+  }
+}
+
+/** POST /api/stores/{store}/tags — 매장에 태그를 하나 추가해요.
+ * 스웨거 문서에 요청/응답 본문 스키마가 안 나와있어서(라라벨 자동 생성 문서라
+ * 필드 설명이 없어요), 가장 흔히 쓰이는 필드명(name)으로 보내고, 응답도
+ * { data: {...} } / { tag: {...} } / 태그 객체 그대로, 세 형태를 모두 시도해요.
+ * 생성된 태그의 id를 못 찾으면(응답 형태가 다르면) null을 돌려주고, 호출한 쪽에서
+ * 화면에 낙관적으로 추가했던 항목을 되돌려요. */
+export async function apiAddStoreTag(
+  storeId: string | number,
+  name: string,
+): Promise<ApiStoreTag | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<Record<string, unknown>>(
+      `/api/stores/${encodeURIComponent(String(storeId))}/tags`,
+      { method: "POST", body: { name }, authAs: "owner" },
+    );
+    const raw =
+      (res?.["data"] as Record<string, unknown> | undefined) ??
+      (res?.["tag"] as Record<string, unknown> | undefined) ??
+      res;
+    const id = raw?.["id"];
+    if (typeof id !== "number") {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[apiAddStoreTag] 응답에서 태그 id를 못 찾았어요. 실제 응답:",
+        res,
+      );
+      return null;
+    }
+    return {
+      id,
+      name: (raw["name"] as string | undefined) ?? name,
+      slug: (raw["slug"] as string | undefined) ?? null,
+    };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[apiAddStoreTag] 태그 추가에 실패했어요:", err);
+    return null;
+  }
+}
+
+/** DELETE /api/tags/{tag} — 태그를 하나 삭제해요(id 기준). */
+export async function apiDeleteTag(tagId: number): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/tags/${encodeURIComponent(String(tagId))}`, {
+      method: "DELETE",
+      authAs: "owner",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export type ApiSeat = {
+  id: number;
+  seat_code: string;
+  seat_name: string;
+  seat_type: "WINDOW" | "NORMAL" | "GROUP" | "OUTDOOR";
+  capacity: number;
+  floor_number: number;
+  status: "AVAILABLE" | "UNAVAILABLE" | "MAINTENANCE";
+  is_active: boolean;
+};
+
+/** GET /api/owner/seats — 좌석 목록 조회.
+ * 2026-08-19 "사장님 운영정보 재로그인 복원" 문서(섹션 11-4)로 확정된 경로.
+ * ⚠️ 예전엔 `/api/owner/stores/{store}/seats`(storeId를 URL에 넣는 경로)를 썼는데,
+ * 메뉴(apiOwnerListMenus)·예약(apiOwnerListReservations)과 똑같은 문제가 있었어요:
+ * ownerStoreId 캐시가 비어있거나 재로그인 직후 아직 안 채워졌으면 storeId가
+ * "undefined" 문자열로 URL에 그대로 박혀서 요청이 조용히 실패했어요(catch에서
+ * null 반환). 그 결과 좌석 상태를 바꿔도 서버엔 반영이 안 됐는데 화면(로컬 상태)엔
+ * 바뀐 것처럼 보여서, 카페 상세/지도의 실시간 잔여 좌석 수가 안 바뀌는 것처럼
+ * 보이는 원인 중 하나였어요. 이 경로는 storeId를 안 받고, 로그인한 사장님 계정의
+ * 활성 OWNER 매장을 서버가 토큰으로 자동 선택해요(메뉴/예약과 동일한 패턴). */
+export async function apiOwnerListSeats(): Promise<ApiSeat[] | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    const res = await apiFetch<{ data: ApiSeat[] }>("/api/owner/seats", {
+      authAs: "owner",
+    });
+    return res.data ?? [];
+  } catch {
+    return null;
+  }
+}
+
+/** POST /api/owner/seats — 좌석 생성(문서 섹션 11-4로 확정된 경로. storeId 불필요). */
+export async function apiOwnerCreateSeat(input: {
+  seat_code: string;
+  seat_name: string;
+  seat_type: "WINDOW" | "NORMAL" | "GROUP" | "OUTDOOR";
+  capacity: number;
+  floor_number: number;
+}): Promise<ApiSeat | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    return await apiFetch<ApiSeat>("/api/owner/seats", {
+      method: "POST",
+      body: input,
+      authAs: "owner",
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** DELETE /api/owner/seats/{seat} — 좌석 삭제(문서 섹션 11-4로 확정된 경로. storeId 불필요). */
+export async function apiOwnerDeleteSeat(
+  seatId: string | number,
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/owner/seats/${encodeURIComponent(String(seatId))}`, {
+      method: "DELETE",
+      authAs: "owner",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** PATCH /api/owner/seats/availability — 좌석 상태 일괄 변경(문서 섹션 11-4).
+ * "총 좌석 수" 스테퍼처럼 여러 좌석 상태를 한 번에 바꿀 때, 좌석마다 PATCH를
+ * 여러 번 보내는 대신 한 번의 요청으로 묶어서 보낼 수 있어요(네트워크 지연으로
+ * 인해 카페 상세/지도의 잔여 좌석 수 반영이 늦어지는 걸 줄여줘요). */
+export async function apiOwnerBulkUpdateSeats(
+  updates: Array<{
+    id: string | number;
+    status: "AVAILABLE" | "UNAVAILABLE" | "MAINTENANCE";
+  }>,
+): Promise<boolean> {
+  if (!isApiConfigured() || updates.length === 0) return false;
+  try {
+    await apiFetch("/api/owner/seats/availability", {
+      method: "PATCH",
+      body: { seats: updates.map((u) => ({ id: u.id, status: u.status })) },
+      authAs: "owner",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* ------------------------------ 카카오맵 주변 카페 ------------------------------ */
+
+/** 카카오맵 API가 돌려주는 주변 카페(CE7) 정보. CafeOn에 등록되지 않은, 카카오맵
+ * 상의 일반 카페들이에요. source가 항상 "KAKAO"라서 CafeOn 등록 매장(ApiStore)과
+ * 지도에서 시각적으로 구분해요. */
+export type ApiKakaoCafe = {
+  source: "KAKAO";
+  kakao_place_id: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+  address?: string | null;
+  road_address?: string | null;
+  phone?: string | null;
+  place_url?: string | null;
+  category_name?: string | null;
+  distance?: number | string | null;
+};
+
+export type ApiKakaoCafesResponse = {
+  data: ApiKakaoCafe[];
+  meta: {
+    page: number;
+    size: number;
+    count: number;
+    total_count: number;
+    pageable_count: number;
+    is_end: boolean;
+  };
+};
+
+/** GET /api/map/kakao-cafes — 현재 지도 범위(bounds) 안의 카카오맵 카페(CE7)를
+ * 전부 조회해요. 2026-08-19 백엔드 변경사항 문서로 추가됐어요.
+ * - 지도 이동/확대가 끝날 때마다(예: 카카오맵 idle 이벤트) 현재 bounds로 호출해요.
+ * - 백엔드가 카카오 REST API 키를 아직 설정하지 않았으면 503을 돌려줄 수 있어요
+ *   (프론트에는 카카오 REST API 키를 절대 넣지 않아요 — JavaScript 키와는 달라요).
+ * - 이 API는 카카오 CE7(카페) 결과만 반환하고, CafeOn 등록 매장은 별도로
+ *   GET /api/map/stores(=apiListStores)에서 조회해요. */
+export async function apiGetKakaoCafes(params: {
+  sw_lat: number;
+  sw_lng: number;
+  ne_lat: number;
+  ne_lng: number;
+  page?: number;
+  size?: number;
+}): Promise<ApiKakaoCafesResponse | null> {
+  if (!isApiConfigured()) return null;
+  try {
+    return await apiFetch<ApiKakaoCafesResponse>("/api/map/kakao-cafes", {
+      query: params,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** PATCH /api/owner/seats/{seat} — 좌석 상태 변경(문서 섹션 11-4로 확정된 경로. storeId 불필요). */
+export async function apiOwnerUpdateSeat(
+  seatId: string | number,
+  status: "AVAILABLE" | "UNAVAILABLE" | "MAINTENANCE",
+): Promise<boolean> {
+  if (!isApiConfigured()) return false;
+  try {
+    await apiFetch(`/api/owner/seats/${encodeURIComponent(String(seatId))}`, {
+      method: "PATCH",
+      body: { status },
+      authAs: "owner",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
