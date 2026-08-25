@@ -30,7 +30,6 @@ import {
   apiGetStoreReviews,
   apiOwnerUpdateBusinessStatus,
   apiOwnerUpdateStoreProfile,
-  apiGetStoreCongestion,
   isApiConfigured,
   type ApiStore,
   type ApiStoreTag,
@@ -43,11 +42,7 @@ import {
 } from "@/lib/api";
 import { useOwnerAuth } from "@/lib/owner-auth-store";
 import { geocodeAddress } from "@/lib/kakao-map-sdk";
-import {
-  congestionFromAvailability,
-  estimateCongestionFromRatio,
-  type CongestionLevel,
-} from "@/lib/seat-congestion";
+import { estimateCongestionFromRatio, type CongestionLevel } from "@/lib/seat-congestion";
 
 /* ------------------------------- Types ------------------------------- */
 
@@ -437,9 +432,9 @@ type OwnerContextValue = {
    * 원래 상태로 되돌리면서 이 메시지를 채워요 — "눌러도 반영이 안 되는" 것처럼
    * 보이지 않고 왜 안 됐는지 알 수 있게요. 성공하면 다시 null이 돼요. */
   seatSyncError: string | null;
-  /** 손님 화면(지도/검색/카페 상세)과 정확히 같은 값이에요 — 둘 다 서버
-   * GET /api/stores/{store}/congestion 값을 그대로 써요(seat-congestion.ts).
-   * 아직 못 불러왔을 때만 좌석 수로 추정한 값을 잠깐 보여줘요. */
+  /** 지금 이 화면의 좌석 수(seats)로 이 화면이 직접 계산한 값이에요
+   * (estimateCongestionFromRatio, seat-congestion.ts). 화면에 보이는
+   * "남은 좌석" 숫자와 항상 같은 순간의 값이라 서로 어긋나지 않아요. */
   congestion: CongestionLevel;
 
   orders: OwnerOrder[];
@@ -502,6 +497,43 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
   // 이제 메뉴/예약과 동일하게 서버에서 실제 좌석 목록을 불러와요.
   const [seats, setSeats] = useState<OwnerSeat[]>(initialSeats);
   const [seatSyncError, setSeatSyncError] = useState<string | null>(null);
+  // 좌석 저장 실패 안내(빨간 배너)가 화면에 계속 눌러붙어 있지 않도록,
+  // 떠 있는 동안 일정 시간(5초) 뒤엔 저절로 사라지게 해요. 다만 배너 자체는
+  // 없애지 않아요 — 이 배너는 "정말로 서버 저장에 실패했다"는 신호라서,
+  // 무작정 안 보이게만 하면 좌석 상태가 실제로는 저장되지 않았는데도
+  // 사장님이 눈치채지 못하고(손님 화면 잔여 좌석 수도 그대로 안 바뀐 채)
+  // 넘어가게 돼요. 대신 아래 setSeatStatus를 요청 큐로 바꿔서, 여러 좌석을
+  // 빠르게 연달아 탭해도 서버로는 한 번에 하나씩만 보내 개발용 백엔드가
+  // 요청을 놓쳐 실패하는 일 자체가 훨씬 줄어들게 했어요 — 그래서 이 배너를
+  // 볼 일 자체가 원래보다 훨씬 적어질 거예요.
+  const seatSyncErrorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showSeatSyncError = (message: string) => {
+    setSeatSyncError(message);
+    if (seatSyncErrorTimeoutRef.current) clearTimeout(seatSyncErrorTimeoutRef.current);
+    seatSyncErrorTimeoutRef.current = setTimeout(() => {
+      setSeatSyncError(null);
+      seatSyncErrorTimeoutRef.current = null;
+    }, 5000);
+  };
+  const clearSeatSyncError = () => {
+    if (seatSyncErrorTimeoutRef.current) {
+      clearTimeout(seatSyncErrorTimeoutRef.current);
+      seatSyncErrorTimeoutRef.current = null;
+    }
+    setSeatSyncError(null);
+  };
+  // 좌석 상태 저장(PATCH) 요청을 순서대로만 서버에 보내기 위한 큐예요.
+  // ⚠️ 예전엔 좌석을 여러 개 빠르게 연달아 탭하면(예: 갑자기 손님이 몰려
+  // 한꺼번에 "사용중"으로 바꿀 때) PATCH 요청이 전부 동시에 나갔어요.
+  // 개발용 백엔드(대부분 php artisan serve 같은 단일 프로세스)는 동시
+  // 요청 중 일부를 놓치기 쉬워서, 실제로 몇몇 좌석은 저장에 실패하고
+  // "좌석 상태 저장에 실패했어요" 배너가 떴어요. 이때 실패한 좌석은 서버에
+  // 반영되지 않은 채로 남아서, 손님 화면(잔여 좌석 수)이 실제와 다르게
+  // (옛 값 그대로) 보이는 원인이 됐어요. addSeatsBatch/removeSeatsBatch와
+  // 같은 방식으로, 화면은 탭하는 즉시 바뀌고 서버 저장만 이 큐를 통해
+  // 하나씩 순서대로 이어가요.
+  const seatStatusQueueRef = useRef<Promise<void>>(Promise.resolve());
+
   // ⚠️ 예전엔 좌석 목록을 못 불러와도(서버 연결 실패 등) 그냥 seats가 빈
   // 배열로 남아서, 화면은 "아직 등록된 좌석이 없어요"라고 보여줬어요. 근데
   // 실제로는 서버에 이미 좌석이 있는데 "못 불러온 것"과 "진짜 0개인 것"을
@@ -513,9 +545,6 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
   const [seatsResetting, setSeatsResetting] = useState(false);
   const [seatsLoadFailed, setSeatsLoadFailed] = useState(false);
   const [seatsRefreshKey, setSeatsRefreshKey] = useState(0);
-  // 서버에서 불러온 실제 혼잡도(손님 화면과 동일한 값). 아직 못 불러왔으면
-  // null이고, 그동안은 좌석 수로 추정한 값을 화면에 보여줘요.
-  const [serverCongestion, setServerCongestion] = useState<CongestionLevel | null>(null);
   const [orders, setOrders] = useState<OwnerOrder[]>(initialOrders);
   // ⚠️ 8초 폴링 응답이 도착 순서를 보장하지 않아서, 방금 접수/취소한 주문을
   // "그 전에 이미 나가 있던" 낡은 폴링 응답이 되돌려버리는 문제가 있었어요
@@ -685,54 +714,6 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     };
   }, [ownerStoreId]);
 
-  // 혼잡도(여유/주의/혼잡)를 서버에서 불러와요.
-  // ⚠️ "사장님 화면엔 주의인데 손님 화면엔 여유로 뜬다"는 문제의 원인은 두
-  // 화면이 서로 다른 계산식을 썼기 때문이었어요(seat-congestion.ts 상단 설명
-  // 참고). 이제 손님 화면과 완전히 같은 엔드포인트(GET
-  // /api/stores/{store}/congestion)를 그대로 불러와서 항상 같은 값을 보여줘요.
-  // 주문/좌석과 마찬가지로 8초마다 다시 불러오고, 탭 복귀 시에도 즉시 갱신해요.
-  //
-  // ⚠️ 2026-08-25 추가: 예전엔 이 fetch가 실패해도(예: 백엔드 서버에 지금 이
-  // 기기에서 접속이 안 될 때) serverCongestion을 그대로 뒀어요. 그래서 한 번
-  // 성공했을 때 받은 값(예: "주의")이 그대로 굳어버려서, 그사이 좌석을 전부
-  // 비워도(12석 중 12석 비어있음) 화면엔 오래된 "주의" 배지가 계속 남아있는
-  // 것처럼 실제 좌석 현황과 안 맞는 상태로 보였어요. 이제 이 fetch가 실패하면
-  // serverCongestion을 null로 되돌려서, 아래 congestion 계산이 곧바로 지금
-  // 화면에 있는 실제 좌석 수(estimateCongestionFromRatio)로 다시 맞춰요 —
-  // 서버에 다시 연결되면 그 다음 8초 주기 때 서버 값으로 또 갱신돼요.
-  useEffect(() => {
-    if (!ownerStoreId) return;
-    let cancelled = false;
-    const load = () => {
-      apiGetStoreCongestion(ownerStoreId).then((res) => {
-        if (cancelled) return;
-        if (!res) {
-          setServerCongestion(null);
-          return;
-        }
-        // ⚠️ 2026-08-25: 서버가 내려주는 congestion 라벨(RELAXED/BUSY 등) 대신,
-        // 같은 응답에 들어있는 실제 좌석 숫자(available_capacity/total_capacity)로
-        // 직접 등급을 계산해요. 백엔드의 congestion 라벨 계산 자체가 실제 남은
-        // 좌석 비율과 반대로 나오는 경우가 있어서(예: 1석만 남았는데 "여유"),
-        // 라벨을 그대로 믿는 대신 원본 숫자로 우리가 다시 판정해요.
-        setServerCongestion(congestionFromAvailability(res));
-      });
-    };
-    load();
-    const interval = setInterval(load, 8000);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") load();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", load);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", load);
-    };
-  }, [ownerStoreId]);
-
   // 매장 프로필(이름/설명/주소/전화/영업시간/영업상태/대표이미지)을 서버에서 불러와요.
   // 회원가입 응답에도 store 정보가 함께 오지만, 로그인으로 들어온 경우나 새로고침한
   // 경우까지 항상 최신값으로 채우기 위해 ownerStoreId가 생길 때마다 다시 조회해요.
@@ -779,14 +760,21 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     };
   }, [ownerStoreId]);
 
-  // 서버 값이 아직 없으면(로딩 중/API 미설정) 좌석 수로 추정한 값을 대신 써요.
-  // 서버 값이 오면 항상 그 값이 우선이라 손님 화면과 어긋나지 않아요.
-  const congestion =
-    serverCongestion ??
-    estimateCongestionFromRatio(
-      seats.filter((s) => s.status === "비어있음").length,
-      seats.length
-    );
+  // ⚠️ 2026-08-25: 예전엔 이 값을 서버 폴링(GET .../congestion, 8초마다)으로
+  // 따로 받아와서 화면에 보여줬어요. 그런데 그 서버 값은 "지금 이 화면에 실제로
+  // 보이는 좌석 수(total/remaining)"와 같은 순간의 값이 아니에요 — 방금 좌석을
+  // 늘렸거나 상태를 바꿨는데 아직 서버 저장이 끝나지 않았을 때(또는 이 기기에서
+  // 백엔드 접속 자체가 안 될 때)는 서버가 옛 숫자를 기준으로 계산한 값을
+  // 돌려주기 때문에, 화면엔 분명 "20석 중 20석 남음"인데 배지는 "주의"로
+  // 뜨는 것처럼 숫자와 등급이 서로 안 맞아 보이는 문제가 있었어요. 8초마다
+  // 그 값이 다시 갱신되면서 배지가 등급 사이를 오가며 깜빡이기도 했고요.
+  // 지금은 화면에 그대로 보이는 좌석 수(seats)로 이 화면이 직접 계산해요 —
+  // 그래야 배지와 "남은 좌석" 숫자가 항상 같은 순간의 값이라 절대 어긋나지
+  // 않고, 네트워크 왕복을 안 기다리니 좌석 수를 바꾼 즉시 반영돼요.
+  const congestion = estimateCongestionFromRatio(
+    seats.filter((s) => s.status === "비어있음").length,
+    seats.length
+  );
 
   const refetchSales = () => setSalesRefreshKey((k) => k + 1);
 
@@ -916,21 +904,26 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     const prevStatus = seats.find((s) => s.id === id)?.status;
     setSeats((prev) => prev.map((s) => (s.id === id ? { ...s, status } : s)));
     if (!isOwnerLoggedIn || isTempSeatId(id) || !isApiConfigured()) return;
-    void apiOwnerUpdateSeat(id, seatStateToApiStatus(status)).then((ok) => {
-      if (ok) {
-        setSeatSyncError(null);
-        return;
-      }
-      // 저장 실패 — 화면이 실제로 저장된 상태와 다르게 보이지 않도록 원래
-      // 상태로 되돌리고, 왜 안 됐는지 안내해요("눌러도 반영이 안 되는 것
-      // 같다"는 혼란의 원인이 바로 이 조용한 실패였어요).
-      if (prevStatus) {
-        setSeats((prev) => prev.map((s) => (s.id === id ? { ...s, status: prevStatus } : s)));
-      }
-      setSeatSyncError(
-        "좌석 상태 저장에 실패했어요. 백엔드 서버 주소(192.168.x.x)에 지금 이 기기에서 접속할 수 있는지 확인해주세요.",
-      );
-    });
+    // 여러 좌석을 빠르게 연달아 탭해도 서버로는 이전 요청이 끝난 뒤에만
+    // 다음 요청을 보내요(seatStatusQueueRef 설명 참고) — 화면은 탭하는
+    // 즉시 바뀌고, 서버 저장만 안전한 속도로 뒤따라가요.
+    seatStatusQueueRef.current = seatStatusQueueRef.current.then(() =>
+      apiOwnerUpdateSeat(id, seatStateToApiStatus(status)).then((ok) => {
+        if (ok) {
+          clearSeatSyncError();
+          return;
+        }
+        // 저장 실패 — 화면이 실제로 저장된 상태와 다르게 보이지 않도록 원래
+        // 상태로 되돌리고, 왜 안 됐는지 안내해요("눌러도 반영이 안 되는 것
+        // 같다"는 혼란의 원인이 바로 이 조용한 실패였어요).
+        if (prevStatus) {
+          setSeats((prev) => prev.map((s) => (s.id === id ? { ...s, status: prevStatus } : s)));
+        }
+        showSeatSyncError(
+          "좌석 상태 저장에 실패했어요. 백엔드 서버 주소(192.168.x.x)에 지금 이 기기에서 접속할 수 있는지 확인해주세요.",
+        );
+      }),
+    );
   };
 
   const addSeat = (label: string): Promise<boolean> => {
@@ -956,12 +949,12 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
         // 대신 왜 사라졌는지 안내를 남겨요(예전엔 여기서 조용히 사라지기만
         // 해서 "숫자를 입력해도 아무 반응이 없다"는 것처럼 보였어요).
         setSeats((prev) => prev.filter((s) => s.id !== tempId));
-        setSeatSyncError(
+        showSeatSyncError(
           "좌석 저장에 실패했어요. 백엔드 서버 주소(192.168.x.x)에 지금 이 기기에서 접속할 수 있는지 확인해주세요.",
         );
         return false;
       }
-      setSeatSyncError(null);
+      clearSeatSyncError();
       // 서버가 발급한 진짜 id로 교체해요. (이후 상태변경/삭제가 서버에도 반영되도록)
       setSeats((prev) =>
         prev.map((s) => (s.id === tempId ? { ...s, id: String(created.id) } : s))
@@ -976,12 +969,12 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     if (!isOwnerLoggedIn || isTempSeatId(id) || !isApiConfigured()) return Promise.resolve(true);
     return apiOwnerDeleteSeat(id).then((ok) => {
       if (ok) {
-        setSeatSyncError(null);
+        clearSeatSyncError();
         return true;
       }
       // 삭제 실패 — 되돌려서 서버와 다시 맞추고 안내해요.
       if (removed) setSeats((prev) => [...prev, removed]);
-      setSeatSyncError(
+      showSeatSyncError(
         "좌석 삭제에 실패했어요. 백엔드 서버 주소(192.168.x.x)에 지금 이 기기에서 접속할 수 있는지 확인해주세요.",
       );
       return false;
@@ -1033,12 +1026,12 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
         if (!created) {
           const notYetSaved = new Set(entries.slice(i).map((e) => e.tempId));
           setSeats((prev) => prev.filter((s) => !notYetSaved.has(s.id)));
-          setSeatSyncError(
+          showSeatSyncError(
             "좌석 저장에 실패했어요. 백엔드 서버 주소(192.168.x.x)에 지금 이 기기에서 접속할 수 있는지 확인해주세요.",
           );
           return;
         }
-        setSeatSyncError(null);
+        clearSeatSyncError();
         setSeats((prev) =>
           prev.map((s) => (s.id === tempId ? { ...s, id: String(created.id) } : s)),
         );
@@ -1067,12 +1060,12 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
         if (!ok) {
           const seat = removedSeats.find((s) => s.id === id);
           if (seat) setSeats((prev) => [...prev, seat]);
-          setSeatSyncError(
+          showSeatSyncError(
             "좌석 삭제에 실패했어요. 백엔드 서버 주소(192.168.x.x)에 지금 이 기기에서 접속할 수 있는지 확인해주세요.",
           );
           return;
         }
-        setSeatSyncError(null);
+        clearSeatSyncError();
       }
     })();
   };
@@ -1105,7 +1098,7 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     if (seatsResetting || seats.length === 0) return;
     const targets = seats;
     setSeatsResetting(true);
-    setSeatSyncError(null);
+    clearSeatSyncError();
 
     Promise.all(
       targets.map(async (seat) => {
@@ -1124,11 +1117,11 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
       setSeats((prev) => prev.filter((s) => failedIds.has(s.id)));
       setSeatsResetting(false);
       if (failedIds.size > 0) {
-        setSeatSyncError(
+        showSeatSyncError(
           `좌석 ${failedIds.size}개는 삭제하지 못했어요. 백엔드 서버 주소(192.168.x.x)에 지금 이 기기에서 접속할 수 있는지 확인한 뒤 다시 시도해주세요.`,
         );
       } else {
-        setSeatSyncError(null);
+        clearSeatSyncError();
       }
     });
   };
@@ -1362,7 +1355,6 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
       seatsLoading,
       seatsLoadFailed,
       seatsResetting,
-      serverCongestion,
       orders,
       menu,
       reviews,

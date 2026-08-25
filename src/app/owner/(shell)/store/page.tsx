@@ -41,7 +41,6 @@ export default function OwnerStorePage() {
     setSeatStatus,
     addSeatsBatch,
     removeSeatsBatch,
-    seatSyncError,
     seatsLoading,
     seatsLoadFailed,
     seatsResetting,
@@ -127,14 +126,6 @@ export default function OwnerStorePage() {
   return (
     <div className="flex flex-col">
       <Header title="좌석 관리" />
-
-      {/* 저장이 서버에 실패하면(주로 백엔드 주소에 접속이 안 될 때) 화면이
-          조용히 원래대로 되돌아가는 대신 이유를 알려줘요. */}
-      {seatSyncError && (
-        <div className="mx-6 mt-4 rounded-xl bg-danger-tint px-4 py-3 text-[13px] font-medium text-danger">
-          {seatSyncError}
-        </div>
-      )}
 
       {/* 초기화(전체 삭제) 요청이 서버 응답을 기다리는 중이에요. 이 동안엔
           "총 좌석 수"가 실제로 몇 개인지 아직 확정되지 않았기 때문에, 화면이
