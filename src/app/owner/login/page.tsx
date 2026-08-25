@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -14,15 +14,42 @@ export default function OwnerLoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // ⚠️ "Too Many Attempts." 대응: /login/page.tsx(손님용)와 같은 이유로,
+  // 429(요청 과다) 응답을 받으면 남은 시간(초) 동안 버튼을 막아서 서버 쪽
+  // "시도 횟수"가 더 쌓여 잠금이 길어지는 걸 막아요.
+  const [cooldown, setCooldown] = useState(0);
+  const cooldownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+    };
+  }, []);
+
+  const startCooldown = (seconds: number) => {
+    if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+    setCooldown(seconds);
+    cooldownTimer.current = setInterval(() => {
+      setCooldown((prev) => {
+        if (prev <= 1) {
+          if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
 
   const handleLogin = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    if (cooldown > 0) return;
     setError(null);
     const result = await ownerLogin(email, password);
     if (result.ok) {
       router.push("/owner");
     } else {
       setError(result.error);
+      if (result.retryAfterSeconds) startCooldown(result.retryAfterSeconds);
     }
   };
 
@@ -78,10 +105,14 @@ export default function OwnerLoginPage() {
         <div className="mt-2">
           <button
             type="submit"
-            disabled={ownerAuthLoading}
+            disabled={ownerAuthLoading || cooldown > 0}
             className="flex h-14 w-full items-center justify-center rounded-2xl bg-trust text-[16px] font-bold text-white active:bg-trust-dark disabled:opacity-60"
           >
-            {ownerAuthLoading ? "로그인 중..." : "로그인"}
+            {ownerAuthLoading
+              ? "로그인 중..."
+              : cooldown > 0
+                ? `${cooldown}초 후 다시 시도`
+                : "로그인"}
           </button>
         </div>
       </form>

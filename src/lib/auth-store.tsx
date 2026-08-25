@@ -23,7 +23,16 @@ import {
   type ApiUser,
 } from "@/lib/api";
 
-type AuthResult = { ok: true } | { ok: false; error: string };
+type AuthResult =
+  | { ok: true }
+  | {
+      ok: false;
+      error: string;
+      /** 429(요청 과다) 실패일 때만 채워져요 — "몇 초 후 다시 시도할 수
+       * 있는지"예요. 로그인 화면이 버튼을 잠깐 비활성화하고 카운트다운을
+       * 보여줄 때 써요. */
+      retryAfterSeconds?: number;
+    };
 
 /** 화면에 표시/수정하는 손님 프로필. 이메일은 회원가입 때 받은 값을 그대로 쓰고,
  * 이름/전화번호/프로필사진/생년월일은 회원가입 후 프로필 관리 화면에서 직접 입력해 저장해요.
@@ -207,7 +216,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return { ok: true };
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "로그인에 실패했어요. 다시 시도해주세요.";
-      return { ok: false, error: message };
+      const retryAfterSeconds = err instanceof ApiError ? err.retryAfterSeconds : undefined;
+      return { ok: false, error: message, retryAfterSeconds };
     } finally {
       setAuthLoading(false);
     }
@@ -244,7 +254,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return { ok: true };
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "회원가입에 실패했어요. 다시 시도해주세요.";
-      return { ok: false, error: message };
+      const retryAfterSeconds = err instanceof ApiError ? err.retryAfterSeconds : undefined;
+      return { ok: false, error: message, retryAfterSeconds };
     } finally {
       setAuthLoading(false);
     }

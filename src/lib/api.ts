@@ -139,15 +139,21 @@ export function setOwnerStoreId(storeId: number | null) {
 export class ApiError extends Error {
   status: number;
   fieldErrors?: Record<string, string[]>;
+  /** 429(요청 과다) 응답일 때, 서버가 Retry-After 헤더로 알려준 "몇 초 뒤에
+   * 다시 시도할 수 있는지"예요. 헤더가 없으면 undefined. 로그인/회원가입 화면이
+   * "n초 후 다시 시도해주세요" 같은 카운트다운을 보여줄 때 써요. */
+  retryAfterSeconds?: number;
   constructor(
     message: string,
     status: number,
     fieldErrors?: Record<string, string[]>,
+    retryAfterSeconds?: number,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.fieldErrors = fieldErrors;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -177,6 +183,16 @@ async function apiFetch<T>(
     query?: Record<string, string | number | boolean | undefined>;
     authAs?: AuthAs;
     timeoutMs?: number;
+    /** ⚠️ 429(요청 과다/Too Many Attempts)를 받았을 때 자동 재시도할지 여부.
+     * 기본값 true — 매장/메뉴 조회처럼 "몇백 ms 뒤 백엔드가 밀린 요청을 처리하고
+     * 나면 성공하는" 일반적인 상황을 위한 거예요.
+     * 로그인/회원가입처럼 백엔드의 "로그인 시도 횟수 제한(throttle)"에 걸려서
+     * 429가 난 경우는 성격이 완전히 달라요 — 이건 몇백 ms 안 기다린다고 풀리는
+     * 게 아니라 보통 분 단위로 잠기는 제한이라서, 여기서 자동으로 즉시
+     * 재시도하면 오히려 "시도 횟수"만 추가로 소모해서 잠금이 더 빨리 걸리고
+     * 더 길게 유지돼요. 그래서 로그인/회원가입 API 호출부에서는 이 값을
+     * false로 넘겨서 자동 재시도를 끄고, 실패를 그대로 위로 올려요. */
+    retryOn429?: boolean;
     /** 내부 재시도 호출에서만 써요 — 바깥에서 넘기지 마세요. */
     _retryCount?: number;
   } = {},
@@ -187,6 +203,7 @@ async function apiFetch<T>(
     query,
     authAs = "none",
     timeoutMs = DEFAULT_TIMEOUT_MS,
+    retryOn429 = true,
     _retryCount = 0,
   } = options;
 
@@ -261,8 +278,18 @@ async function apiFetch<T>(
     // "요청 자체가 서버에 도달하지 못하고 거절된" 상황에서는 다시 보내도
     // 안전해서(서버가 실제로 처리를 시작한 뒤 응답만 못 준 경우와는 달라요),
     // 최대 2번까지 짧게 기다렸다가 자동으로 재시도해요.
-    const isTransient = res.status === 429 || (res.status >= 502 && res.status <= 504);
-    if (isTransient && _retryCount < 2) {
+    // 429(Too Many Attempts)와 502~504는 둘 다 "요청 자체가 서버에서 처리되지
+    // 못하고 거절됨"이지만 원인은 완전히 달라요:
+    //   - 502~504: 그 순간 서버가 잠깐 응답을 못 만든 것뿐이라, 몇백 ms 뒤
+    //     재시도하면 대부분 성공해요. → 계속 자동 재시도해요.
+    //   - 429: 백엔드의 요청 제한(throttle)에 걸린 거라, 몇백 ms를 기다려도
+    //     안 풀려요(보통 분 단위 window). 게다가 로그인처럼 "시도 횟수 자체"를
+    //     세는 엔드포인트라면 즉시 재시도가 오히려 시도 횟수를 더 빨리
+    //     소모시켜서 잠금을 악화시켜요. → retryOn429가 false인 호출(로그인/
+    //     회원가입)은 재시도하지 않고 바로 실패로 올려요.
+    const isRetryableServerHiccup = res.status >= 502 && res.status <= 504;
+    const isRetryableRateLimit = res.status === 429 && retryOn429;
+    if ((isRetryableServerHiccup || isRetryableRateLimit) && _retryCount < 2) {
       await delay(400 * (_retryCount + 1));
       return apiFetch<T>(path, { ...options, _retryCount: _retryCount + 1 });
     }
@@ -271,6 +298,30 @@ async function apiFetch<T>(
       message?: string;
       errors?: Record<string, string[]>;
     };
+
+    if (res.status === 429) {
+      // Laravel의 기본 요청 제한 미들웨어는 본문이 있어도 message가 영어
+      // 원문 "Too Many Attempts."로 오고, 몇 초 뒤 다시 시도할 수 있는지는
+      // Retry-After 헤더로만 알려줘요(응답 본문엔 안 담겨 있어요). 이 헤더를
+      // 읽어서 "n초 후 다시 시도해주세요"처럼 실제로 도움이 되는 한국어
+      // 안내로 바꾸고, 화면(로그인 버튼 등)이 카운트다운을 보여줄 수 있게
+      // retryAfterSeconds로 함께 넘겨요.
+      const retryAfterHeader = res.headers.get("Retry-After");
+      const retryAfterSeconds = retryAfterHeader
+        ? Number.parseInt(retryAfterHeader, 10)
+        : undefined;
+      const waitMsg =
+        retryAfterSeconds && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? `${retryAfterSeconds}초 후 다시 시도해주세요.`
+          : "잠시 후 다시 시도해주세요.";
+      throw new ApiError(
+        `요청이 너무 많아 잠시 제한됐어요. ${waitMsg}`,
+        res.status,
+        d.errors,
+        retryAfterSeconds && Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
+      );
+    }
+
     throw new ApiError(
       d.message ?? `요청에 실패했어요 (${res.status})`,
       res.status,
@@ -351,7 +402,9 @@ export type ApiStore = {
 export async function apiCustomerLogin(email: string, password: string) {
   return apiFetch<{ token: string; token_type: string; user: ApiUser }>(
     "/api/auth/customer/login",
-    { method: "POST", body: { email, password } },
+    // retryOn429: false — 로그인 시도 횟수 제한(throttle)에 걸린 상태에서
+    // 즉시 자동 재시도하면 시도 횟수만 더 쌓여서 잠금이 더 길어져요.
+    { method: "POST", body: { email, password }, retryOn429: false },
   );
 }
 
@@ -369,7 +422,12 @@ export async function apiOwnerLogin(email: string, password: string) {
     store_id?: number;
     store?: ApiStore;
     stores?: ApiStore[];
-  }>("/api/auth/owner/login", { method: "POST", body: { email, password } });
+  }>("/api/auth/owner/login", {
+    method: "POST",
+    body: { email, password },
+    // 위 apiCustomerLogin과 같은 이유로 재시도를 꺼요.
+    retryOn429: false,
+  });
 }
 
 /** GET /api/owner/store — 로그인한 사장님의 대표 매장을 조회해요.
@@ -404,7 +462,7 @@ export async function apiSignup(input: {
     token: string;
     token_type: string;
     user: ApiUser;
-  }>("/api/auth/signup", { method: "POST", body: input });
+  }>("/api/auth/signup", { method: "POST", body: input, retryOn429: false });
 }
 
 /** POST /api/auth/owner/signup — 사장님(점주) 회원가입. 응답에 store가 함께 와요. */
@@ -426,7 +484,11 @@ export async function apiOwnerSignup(input: {
     token_type: string;
     user: ApiUser;
     store: ApiStore;
-  }>("/api/auth/owner/signup", { method: "POST", body: input });
+  }>("/api/auth/owner/signup", {
+    method: "POST",
+    body: input,
+    retryOn429: false,
+  });
 }
 
 /** 소셜 로그인(카카오/구글/네이버) 시작 URL.
