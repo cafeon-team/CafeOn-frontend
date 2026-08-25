@@ -10,9 +10,13 @@
  * 두 계산식의 경계값이 서로 달라서, 똑같은 좌석 상황인데도 사장님 화면엔 "주의"로,
  * 손님 화면엔 "여유"로 다르게 보이는 문제가 있었어요.
  *
- * 이제 두 화면 모두 서버 값(CONGESTION_API_TO_LEVEL로 변환)을 "같은 값"으로
- * 사용해요. estimateCongestionFromRatio는 서버 연동 전(API 미설정)이거나 아직 값을
- * 못 불러왔을 때만 쓰는 대체용 추정치예요 — 실제 값이 오면 항상 서버 값이 우선해요. */
+ * ⚠️ 2026-08-25: 그 다음엔 두 화면 모두 서버의 congestion 라벨(CONGESTION_API_TO_LEVEL로
+ * 변환)을 그대로 믿고 썼는데, 실제로는 그 라벨 자체가 실제 남은 좌석 비율과 반대로
+ * 나오는 경우가 있었어요(백엔드 계산 로직 문제로 보여요 — 아래 congestionFromAvailability
+ * 설명 참고). 그래서 지금은 라벨 대신, 같은 응답에 함께 들어있는 실제 숫자
+ * (available_capacity/total_capacity)로 두 화면이 똑같이 직접 계산해요
+ * (congestionFromAvailability). CONGESTION_API_TO_LEVEL은 참고용으로 남겨뒀지만
+ * 더 이상 화면에서 쓰지 않아요. */
 
 import type { ApiAvailability } from "@/lib/api";
 
@@ -26,25 +30,54 @@ export const congestionStyle: Record<CongestionLevel, { bg: string; text: string
   혼잡: { bg: "bg-brand-tint", text: "text-brand-dark" },
 };
 
-/** 서버 congestion 값 → 화면 3단계. 손님 화면(stores-store.tsx)이 쓰던 매핑과
- * 완전히 동일해서, 사장님 화면도 이 함수를 쓰면 손님이 보는 값과 항상 일치해요. */
+/** 서버 congestion 값 → 화면 3단계.
+ * ⚠️ 2026-08-24 조정: 예전엔 RELAXED/NORMAL→여유, BUSY→주의, NEAR_FULL/UNAVAILABLE→혼잡
+ * 이었는데, 이 경계값대로면 "총 12석 중 3석(25%)만 남은" 것처럼 꽤 빠듯한
+ * 상황도 BUSY로 분류돼 "주의"로만 표시되고 "혼잡"까지는 좀처럼 안 떴어요.
+ * (실제로 estimateCongestionFromRatio 같은 비율 계산으로는 25% 남았으면 이미
+ * "혼잡" 구간이에요 — 아래 함수 참고.) 남은 자리가 적을수록 더 엄격하게
+ * "혼잡"로 보이도록 BUSY를 혼잡 쪽으로 옮겼어요: 이제 RELAXED만 여유,
+ * NORMAL만 주의, BUSY부터는(NEAR_FULL·UNAVAILABLE 포함) 혼잡으로 표시해요.
+ * 이 값 자체(RELAXED/NORMAL/BUSY/NEAR_FULL/UNAVAILABLE 판정 기준)는 백엔드가
+ * 정하는 값이라 프론트에서 그 경계(예: 몇 %가 BUSY인지)까지는 못 바꿔요 —
+ * 화면에 "몇 단계로 보여줄지"만 아래 매핑에서 조정할 수 있어요. */
 export const CONGESTION_API_TO_LEVEL: Record<ApiAvailability["congestion"], CongestionLevel> = {
   RELAXED: "여유",
-  NORMAL: "여유",
-  BUSY: "주의",
+  NORMAL: "주의",
+  BUSY: "혼잡",
   NEAR_FULL: "혼잡",
   UNAVAILABLE: "혼잡",
 };
 
-/** 서버 값을 아직 못 불러왔을 때(로딩 중 / API 미설정)만 쓰는 대체 추정치예요.
- * 실제 서버 값이 오면 이 함수 대신 CONGESTION_API_TO_LEVEL을 써야 손님 화면과
- * 어긋나지 않아요. */
+/** 좌석 수(남은 좌석/전체)로 혼잡도 등급을 계산해요. congestionFromAvailability와
+ * setSeatStatus 등 좌석 수를 직접 아는 곳에서 공통으로 써요. */
 export function estimateCongestionFromRatio(remaining: number, total: number): CongestionLevel {
   if (total <= 0 || remaining <= 0) return "혼잡";
   const ratio = remaining / total;
   if (ratio < 1 / 3) return "혼잡";
   if (ratio < 2 / 3) return "주의";
   return "여유";
+}
+
+/** 2026-08-25 추가: GET .../congestion 응답의 `congestion`(RELAXED/NORMAL/…) 라벨을
+ * CONGESTION_API_TO_LEVEL로 옮기는 대신, 같은 응답에 같이 들어있는 실제 숫자
+ * (available_capacity/total_capacity)로 직접 계산해요.
+ *
+ * ⚠️ 실제로 확인해보니 좌석을 11개 채우고 1석만 남았는데도 서버 `congestion`
+ * 값은 "여유"(RELAXED)로, 반대로 12석을 전부 비웠는데도 "혼잡"(BUSY 계열)으로
+ * 내려오는 경우가 있었어요 — 즉 백엔드의 congestion 라벨 계산 자체가 실제
+ * 남은 좌석 비율과 반대로 나오는 문제가 있었어요(이건 프론트 코드가 아니라
+ * 백엔드 쪽 계산 로직 문제라, 백엔드 담당자에게 꼭 확인이 필요해요).
+ * 라벨 대신 같은 응답의 원본 숫자(비율)로 우리가 직접 등급을 매기면, 백엔드가
+ * 그 라벨을 어떻게 계산하든 상관없이 항상 실제 좌석 현황과 일치하는 값을
+ * 보여줄 수 있어요. */
+export function congestionFromAvailability(a: {
+  total_capacity?: number | null;
+  available_capacity?: number | null;
+}): CongestionLevel {
+  const total = a.total_capacity ?? 0;
+  const remaining = a.available_capacity ?? 0;
+  return estimateCongestionFromRatio(remaining, total);
 }
 
 /** 잔여 좌석 상황을 "총 12석 중 3석 남았어요 · 주의" 같은 문장으로 보여줘요. */

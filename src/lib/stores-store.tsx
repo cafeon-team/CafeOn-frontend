@@ -10,11 +10,12 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { type Cafe, type SeatStatus } from "@/lib/data";
+import { type Cafe } from "@/lib/data";
 import {
   apiListStores,
   apiGetStore,
   apiGetStoreCongestion,
+  apiGetStoreRating,
   isApiConfigured,
   resolveImageUrl,
   type ApiStore,
@@ -22,7 +23,7 @@ import {
 } from "@/lib/api";
 import { usePathname } from "next/navigation";
 import { geocodeAddress } from "@/lib/kakao-map-sdk";
-import { CONGESTION_API_TO_LEVEL } from "@/lib/seat-congestion";
+import { congestionFromAvailability } from "@/lib/seat-congestion";
 
 type StoresContextValue = {
   /** 지도/검색/찜 목록에서 공통으로 쓰는 카페(매장) 목록.
@@ -41,12 +42,11 @@ type StoresContextValue = {
 
 const StoresContext = createContext<StoresContextValue | null>(null);
 
-// ⚠️ 예전엔 이 매핑을 여기서 따로 정의했는데, 사장님 화면(owner-store.tsx)은
-// 서버 값 대신 좌석 수로 직접 계산하는 별도 로직을 써서 두 화면이 다른 값을
-// 보여줬어요. 이제 손님/사장님 화면 모두 seat-congestion.ts의 이 매핑
-// 하나만 사용해서 항상 같은 값을 보여줘요.
-const CONGESTION_TO_STATUS: Record<ApiAvailability["congestion"], SeatStatus> =
-  CONGESTION_API_TO_LEVEL;
+// ⚠️ 2026-08-25: 서버 congestion 라벨(RELAXED/BUSY 등)을 그대로 믿는 대신,
+// 같은 응답에 들어있는 실제 좌석 숫자(available_capacity/total_capacity)로
+// 우리가 직접 등급을 계산해요(congestionFromAvailability). 실제 확인해보니
+// 백엔드의 congestion 라벨이 남은 좌석 비율과 반대로 나오는 경우가 있었어요
+// (자세한 내용은 seat-congestion.ts의 congestionFromAvailability 설명 참고).
 
 const KNOWN_AMENITY_SLUGS = ["wifi", "outlet", "parking", "pet"] as const;
 
@@ -111,16 +111,17 @@ export function mapStoreToCafe(
   store: ApiStore,
   availability?: ApiAvailability | null,
   likedIds?: Set<string>,
+  rating?: { rating: number; reviewCount: number } | null,
 ): Cafe {
   const id = String(store.id);
   return {
     id,
     name: store.name,
-    rating: 0,
-    reviewCount: 0,
+    rating: rating?.rating ?? 0,
+    reviewCount: rating?.reviewCount ?? 0,
     distance: "-",
     status: availability
-      ? CONGESTION_TO_STATUS[availability.congestion]
+      ? congestionFromAvailability(availability)
       : "여유",
     seatsFilled: availability?.occupied_capacity ?? 0,
     seatsTotal: availability?.total_capacity ?? 0,
@@ -136,6 +137,8 @@ export function mapStoreToCafe(
     // 사장님이 매장 프로필에서 저장한 대표 이미지. 서버가 상대 경로("/storage/...")를
     // 줄 수도 있어서 resolveImageUrl로 절대 URL로 바꿔둬요(그래야 img src가 바로 동작해요).
     imageUrl: resolveImageUrl(store.thumbnail_url),
+    description: store.description ?? null,
+    businessHours: store.business_hours ?? undefined,
   };
 }
 
@@ -214,12 +217,17 @@ export function StoresProvider({ children }: { children: ReactNode }) {
     apiListStores()
       .then(async (stores) => {
         if (cancelled || !stores) return;
-        const availabilities = await Promise.all(
-          stores.map((s) => apiGetStoreCongestion(s.id)),
-        );
+        // ⚠️ GET /api/stores는 평균 별점을 안 내려줘서, 예전엔 지도/검색/찜
+        // 목록의 별점이 항상 0으로 고정돼 보였어요(리뷰가 실제로 달려도 반영
+        // 안 됨). 카페 상세 화면과 똑같이 매장별 리뷰를 불러와서 평균 별점·
+        // 리뷰 수를 직접 계산해요.
+        const [availabilities, ratings] = await Promise.all([
+          Promise.all(stores.map((s) => apiGetStoreCongestion(s.id))),
+          Promise.all(stores.map((s) => apiGetStoreRating(s.id))),
+        ]);
         if (cancelled) return;
         const mapped = stores.map((s, i) =>
-          mapStoreToCafe(s, availabilities[i]),
+          mapStoreToCafe(s, availabilities[i], undefined, ratings[i]),
         );
         setCafes(mapped);
         setIsMock(false);
@@ -266,7 +274,7 @@ export function StoresProvider({ children }: { children: ReactNode }) {
               if (!availability) return c;
               return {
                 ...c,
-                status: CONGESTION_TO_STATUS[availability.congestion],
+                status: congestionFromAvailability(availability),
                 seatsFilled: availability.occupied_capacity,
                 seatsTotal: availability.total_capacity,
                 updatedAgo: formatUpdatedAgo(
@@ -288,10 +296,12 @@ export function StoresProvider({ children }: { children: ReactNode }) {
 
   const refreshCafe = useCallback((id: string) => {
     if (!isApiConfigured()) return;
-    apiGetStore(id).then((res) => {
+    // 매장 상세와 함께 평균 별점도 같이 다시 불러와요(카페 상세를 한 번
+    // 열었다 지도/찜 목록으로 돌아왔을 때도 별점이 반영되게 해요).
+    Promise.all([apiGetStore(id), apiGetStoreRating(id)]).then(([res, rating]) => {
       if (!res) return;
       setCafes((prev) => {
-        const fresh = mapStoreToCafe(res.store, res.availability);
+        const fresh = mapStoreToCafe(res.store, res.availability, undefined, rating);
         const exists = prev.some((c) => c.id === id);
         if (!exists) return [...prev, { ...fresh, liked: false }];
         return prev.map((c) =>
