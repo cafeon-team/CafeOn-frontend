@@ -4,16 +4,33 @@ import { useRef, useState } from "react";
 import { X } from "lucide-react";
 import Header from "@/components/Header";
 import Toast from "@/components/Toast";
-import { useBenefits } from "@/lib/benefits-store";
+import { useBenefits, type BenefitCouponKind } from "@/lib/benefits-store";
+
+function couponBadge(kind: BenefitCouponKind | undefined): { label: string; className: string } | null {
+  switch (kind) {
+    case "signup":
+      return { label: "가입 혜택", className: "bg-brand-tint text-brand-dark" };
+    case "birthday":
+      return { label: "생일 혜택", className: "bg-amber-100 text-amber-700" };
+    default:
+      return null;
+  }
+}
+
+function isExpired(expiresAt: string | null | undefined): boolean {
+  if (!expiresAt) return false;
+  return expiresAt < new Date().toISOString().slice(0, 10);
+}
 
 export default function BenefitsPage() {
-  const { points, coupons, loading, usePoints, useCoupon } = useBenefits();
+  const { points, coupons, pointLogs, loading, usePoints, useCoupon } = useBenefits();
   const [showPointForm, setShowPointForm] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [amount, setAmount] = useState("");
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const couponListRef = useRef<HTMLDivElement>(null);
 
-  const activeCouponCount = coupons.filter((c) => !c.used).length;
+  const activeCouponCount = coupons.filter((c) => !c.used && !isExpired(c.expiresAt)).length;
 
   const scrollToCoupons = () => {
     couponListRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -74,6 +91,28 @@ export default function BenefitsPage() {
             </button>
           </div>
         </div>
+
+        {pointLogs.length > 0 && (
+          <button
+            onClick={() => setShowHistory((v) => !v)}
+            className="mt-3 w-full text-center text-[12.5px] font-medium text-ink-secondary underline underline-offset-2"
+          >
+            {showHistory ? "적립 내역 닫기" : "포인트 적립 내역 보기"}
+          </button>
+        )}
+        {showHistory && (
+          <div className="mt-2 flex flex-col gap-2 rounded-2xl border border-border bg-white p-4">
+            {pointLogs.slice(0, 10).map((log) => (
+              <div key={log.id} className="flex items-center justify-between text-[13px]">
+                <div>
+                  <p className="font-medium text-ink">{log.reason}</p>
+                  <p className="text-[11.5px] text-ink-muted">{log.createdAt}</p>
+                </div>
+                <p className="font-bold text-brand-dark">+{log.amount.toLocaleString()}P</p>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div ref={couponListRef} className="mt-8 flex items-center justify-between px-6">
@@ -92,32 +131,53 @@ export default function BenefitsPage() {
             {loading ? "불러오는 중..." : "보유한 쿠폰이 없어요."}
           </p>
         )}
-        {coupons.map((c) => (
-          <div
-            key={c.id}
-            className={
-              "flex items-center justify-between rounded-2xl border border-border bg-white p-5 " +
-              (c.used ? "opacity-50" : "")
-            }
-          >
-            <div>
-              <p className="text-[15px] font-bold text-ink">{c.title}</p>
-              <p className="mt-1 text-[12.5px] text-ink-secondary">{c.subtitle}</p>
+        {coupons.map((c) => {
+          const expired = isExpired(c.expiresAt);
+          const badge = couponBadge(c.kind);
+          const disabled = c.used || expired;
+          return (
+            <div
+              key={c.id}
+              className={
+                "flex items-center justify-between rounded-2xl border border-border bg-white p-5 " +
+                (disabled ? "opacity-50" : "")
+              }
+            >
+              <div>
+                <div className="flex items-center gap-1.5">
+                  {badge && (
+                    <span className={`rounded-full px-2 py-0.5 text-[11px] font-bold ${badge.className}`}>
+                      {badge.label}
+                    </span>
+                  )}
+                  <p className="text-[15px] font-bold text-ink">{c.title}</p>
+                </div>
+                <p className="mt-1 text-[12.5px] text-ink-secondary">{c.subtitle}</p>
+                {c.expiresAt && (
+                  <p className="mt-0.5 text-[11.5px] text-ink-muted">
+                    {expired ? "기간 만료" : `${c.expiresAt}까지`}
+                  </p>
+                )}
+              </div>
+              {c.used ? (
+                <span className="rounded-full bg-border px-3 py-1.5 text-[12.5px] font-bold text-ink-muted">
+                  사용 완료
+                </span>
+              ) : expired ? (
+                <span className="rounded-full bg-border px-3 py-1.5 text-[12.5px] font-bold text-ink-muted">
+                  기간 만료
+                </span>
+              ) : (
+                <button
+                  onClick={() => submitCouponUse(c.id, c.title)}
+                  className="rounded-full bg-brand-tint px-3.5 py-1.5 text-[12.5px] font-bold text-brand-dark active:bg-brand/20"
+                >
+                  사용하기
+                </button>
+              )}
             </div>
-            {c.used ? (
-              <span className="rounded-full bg-border px-3 py-1.5 text-[12.5px] font-bold text-ink-muted">
-                사용 완료
-              </span>
-            ) : (
-              <button
-                onClick={() => submitCouponUse(c.id, c.title)}
-                className="rounded-full bg-brand-tint px-3.5 py-1.5 text-[12.5px] font-bold text-brand-dark active:bg-brand/20"
-              >
-                사용하기
-              </button>
-            )}
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {showPointForm && (

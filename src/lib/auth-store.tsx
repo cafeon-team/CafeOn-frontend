@@ -22,6 +22,7 @@ import {
   getCustomerToken,
   type ApiUser,
 } from "@/lib/api";
+import { markPendingSignupBonus } from "@/lib/benefit-flags";
 
 type AuthResult = { ok: true } | { ok: false; error: string };
 
@@ -229,6 +230,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       setCustomerToken("demo");
       setIsLoggedIn(true);
+      // 신규 회원가입 축하 쿠폰을 발급하도록 표시해둬요(BenefitsProvider가 소비해요).
+      markPendingSignupBonus();
       return { ok: true };
     }
     setAuthLoading(true);
@@ -241,6 +244,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return next;
       });
       setIsLoggedIn(true);
+      // 신규 회원가입 축하 쿠폰을 발급하도록 표시해둬요(BenefitsProvider가 소비해요).
+      markPendingSignupBonus();
       return { ok: true };
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "회원가입에 실패했어요. 다시 시도해주세요.";
