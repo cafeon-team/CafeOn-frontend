@@ -358,7 +358,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           birth_date: normalizeBirthDate(birth ?? null),
         });
         setProfile((prev) => {
-          const next: CustomerProfile = fromApiUser(updated, prev);
+          // ⚠️ 진짜 원인을 찾았어요: 백엔드 PUT /api/users/me 응답(updated)이
+          // 성공(200)이어도 응답 바디에 birth_date 필드를 아예 안 담아 돌려줄 때가
+          // 있어요. fromApiUser()는 필드가 "없으면"(undefined) 예전 값(prev)으로
+          // 되돌리는데, 여기서 prev로 "저장하기 누르기 전의 예전 profile"이
+          // 들어가면 방금 성공적으로 저장한 생년월일이 화면에서 다시 빈 값으로
+          // 돌아가버려요(저장 토스트는 뜨지만 몇 초 뒤/다른 화면 갔다오면 사라진
+          // 것처럼 보이는 버그의 진짜 원인이었어요). 그래서 prev 대신, 방금 이
+          // 요청으로 "성공했다고 가정할 수 있는" 값(optimisticNext)을 기본값으로
+          // 넘겨요 — 서버가 실제로 다른 값을 돌려주면(요청이 일부 거부된 경우)
+          // 그 값이 우선하고, 필드가 아예 없을 때만 방금 저장 성공한 값을 써요.
+          const optimisticNext: CustomerProfile = {
+            ...prev,
+            name,
+            phone: phone ?? null,
+            birth: normalizeBirthDate(birth ?? null),
+            profileImageUrl: nextImageUrl,
+          };
+          const next: CustomerProfile = fromApiUser(updated, optimisticNext);
           writeProfileStorage(next);
           return next;
         });

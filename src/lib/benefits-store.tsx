@@ -117,10 +117,11 @@ function addDaysKey(base: Date, days: number): string {
   return dateKey(d);
 }
 
-/** 주문 결제 금액의 5%를 포인트로 적립해요(10P 단위로 내림). */
+/** 주문을 완료할 때마다 정액으로 100P를 적립해요(결제 금액과 무관). */
+const ORDER_COMPLETE_POINT = 100;
 function computeOrderPoints(amount: number): number {
   if (!amount || amount <= 0) return 0;
-  return Math.floor((amount * 0.05) / 10) * 10;
+  return ORDER_COMPLETE_POINT;
 }
 
 const REVIEW_BASE_POINT = 50;
@@ -157,7 +158,7 @@ function readNumberField(obj: Record<string, unknown>, keys: string[]): number |
  *  2) 생일 쿠폰 — 로그인한 손님의 프로필 생년월일(profile.birth)이 오늘과
  *     월/일이 같으면, 그 해에 한 번만 발급해요.
  *  3) 주문 완료 포인트 적립 — useOrders()의 주문 목록을 지켜보다가 상태가
- *     "완료"로 바뀐 주문마다 결제금액의 5%를 포인트로 적립해요.
+ *     "완료"로 바뀐 주문마다 정액 100P를 적립해요.
  *  4) 리뷰 작성 포인트 적립 — useReviews()의 리뷰 목록을 지켜보다가 새로
  *     작성된 리뷰마다 50P(사진 첨부 시 100P)를 적립해요.
  *
