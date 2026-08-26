@@ -363,15 +363,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           return next;
         });
       } catch (err) {
-        // ⚠️ 예전엔 서버 저장이 실패해도 조용히 화면에만 반영하고 "저장 완료"로
-        // 보여줬어요. 그러면 화면은 바뀐 것처럼 보이지만 서버엔 저장이 안 돼서,
-        // 다음에 다시 접속하면(GET /api/users/me로 새로 불러오면) 방금 입력한
-        // 내용이 사라지고 원래 값으로 되돌아간 것처럼 보였어요. 이제는 서버 저장
-        // 실패를 화면에 바로 알려서, 정말로 저장됐는지 아닌지 헷갈리지 않게 했어요.
+        // ⚠️ 예전엔 서버 저장이 실패해도 applyLocal()로 화면(및 localStorage)에는
+        // "저장된 것처럼" 반영해버렸어요. 그러면 그 순간엔 저장된 것처럼 보이지만,
+        // 서버엔 실제로 저장이 안 됐기 때문에 다음에 앱을 새로고침하면(서버에서
+        // 진짜 값을 다시 받아오면서) 방금 입력한 내용이 조용히 사라진 것처럼
+        // 보였어요(특히 생년월일에서 자주 보고됨). 이제는 서버 저장이 실패하면
+        // 절대 로컬 상태/localStorage를 건드리지 않고, 실패했다는 사실만 화면에
+        // 알려서 "성공한 척"하지 않게 했어요. 입력 화면(ProfileEditPage)의 입력값
+        // 자체는 그 화면의 로컬 state라 지워지지 않으니, 원인을 해결한 뒤 같은
+        // 값으로 다시 저장을 누르기만 하면 돼요.
         const message = err instanceof ApiError ? err.message : "서버에 저장하지 못했어요. 다시 시도해주세요.";
         // eslint-disable-next-line no-console
         console.error("[updateProfile] /api/users/me 저장 실패:", err);
-        applyLocal(nextImageUrl);
         return { ok: false, error: message };
       }
       return { ok: true };

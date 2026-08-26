@@ -123,8 +123,8 @@ function computeOrderPoints(amount: number): number {
   return Math.floor((amount * 0.05) / 10) * 10;
 }
 
-const REVIEW_BASE_POINT = 300;
-const REVIEW_PHOTO_BONUS = 200;
+const REVIEW_BASE_POINT = 50;
+const REVIEW_PHOTO_BONUS = 50;
 const SIGNUP_COUPON_VALID_DAYS = 30;
 const BIRTHDAY_COUPON_VALID_DAYS = 7;
 
@@ -159,7 +159,7 @@ function readNumberField(obj: Record<string, unknown>, keys: string[]): number |
  *  3) 주문 완료 포인트 적립 — useOrders()의 주문 목록을 지켜보다가 상태가
  *     "완료"로 바뀐 주문마다 결제금액의 5%를 포인트로 적립해요.
  *  4) 리뷰 작성 포인트 적립 — useReviews()의 리뷰 목록을 지켜보다가 새로
- *     작성된 리뷰마다 300P(사진 첨부 시 500P)를 적립해요.
+ *     작성된 리뷰마다 50P(사진 첨부 시 100P)를 적립해요.
  *
  * 이 네 가지는 백엔드에 전용 지급 API가 없어서(스웨거에 "쿠폰 발급"/"포인트
  * 적립" 엔드포인트가 없어요 — GET으로 조회만 가능), 이 기기(브라우저)에

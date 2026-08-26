@@ -109,7 +109,15 @@ export default function ProfileEditPage() {
         />
       </div>
 
-      {error && <p className="mt-3 px-6 text-[13px] text-danger">{error}</p>}
+      {error && (
+        <div className="mx-6 mt-3 rounded-2xl border border-danger/30 bg-danger/10 px-4 py-3">
+          <p className="text-[13.5px] font-bold text-danger">저장에 실패했어요</p>
+          <p className="mt-1 text-[12.5px] text-danger">{error}</p>
+          <p className="mt-1 text-[12px] text-danger/80">
+            방금 입력한 내용은 화면에 남아있으니, 원인을 확인한 뒤 다시 저장을 눌러주세요.
+          </p>
+        </div>
+      )}
 
       <p className="mt-4 px-6 text-[12.5px] text-ink-muted">
         이메일은 회원가입 시 등록한 정보라 여기서는 변경할 수 없어요.
