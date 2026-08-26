@@ -80,6 +80,73 @@ function writeProfileStorage(profile: CustomerProfile | null) {
   }
 }
 
+// ⚠️ 생년월일이 "뒤로가기 → 로그아웃 → 다시 로그인"하면 0000-00-00으로 돌아가던
+// 문제의 진짜 원인: logout()이 PROFILE_STORAGE_KEY를 통째로 지우는데, 서버가
+// (알려진 백엔드 이슈로) 로그인 응답에서 birth_date를 계속 null로 내려줘요.
+// 로그아웃 전에는 "이 기기에 저장된 값을 믿는다"는 폴백(아래 fromApiUser 호출부)이
+// 있어서 괜찮았지만, 로그아웃이 그 폴백용 캐시까지 함께 지워버리니 재로그인 시점엔
+// 되돌릴 값이 아예 없어서 null이 그대로 화면에 나왔던 거예요.
+//
+// 그래서 생년월일만 "계정(이메일)별"로 별도 저장소에 백업해두고, 이 저장소는
+// logout()이 지우지 않아요. 서버가 이메일과 함께 null을 내려줄 때마다 이 백업을
+// 확인해서 채워 넣고, 서버가 실제 값을 내려주면(혹은 사용자가 직접 저장하면) 이
+// 백업도 함께 최신화해요.
+const BIRTH_OVERRIDE_STORAGE_KEY = "cafeon_profile_birth_by_email";
+
+function normalizeEmailKey(email: string | null | undefined): string | null {
+  const trimmed = (email ?? "").trim().toLowerCase();
+  return trimmed || null;
+}
+
+function readBirthOverrides(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(BIRTH_OVERRIDE_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function getBirthOverride(email: string | null | undefined): string | null {
+  const key = normalizeEmailKey(email);
+  if (!key) return null;
+  return readBirthOverrides()[key] ?? null;
+}
+
+function setBirthOverride(email: string | null | undefined, birth: string | null) {
+  const key = normalizeEmailKey(email);
+  if (!key || typeof window === "undefined") return;
+  try {
+    const overrides = readBirthOverrides();
+    if (birth) {
+      overrides[key] = birth;
+    } else {
+      // 사용자가 생년월일을 직접 지우고 저장한 경우엔 백업도 같이 지워서,
+      // 다음 로그인 때 지운 값이 되살아나지 않게 해요.
+      delete overrides[key];
+    }
+    window.localStorage.setItem(BIRTH_OVERRIDE_STORAGE_KEY, JSON.stringify(overrides));
+  } catch {
+    // 시크릿 모드 등 localStorage를 못 쓰는 환경이면 조용히 무시해요.
+  }
+}
+
+/** 서버 응답으로 만든 프로필에 이메일별 생년월일 백업을 적용해요.
+ * - 서버가 실제 값을 줬으면 그 값을 그대로 쓰고, 백업도 최신값으로 맞춰둬요.
+ * - 서버가 null/빈 값을 줬으면(알려진 백엔드 이슈) 이 기기에 백업해둔 값이
+ *   있는지 확인해서 채워 넣어요. */
+function applyBirthOverride(profile: CustomerProfile): CustomerProfile {
+  if (profile.birth) {
+    setBirthOverride(profile.email, profile.birth);
+    return profile;
+  }
+  const override = getBirthOverride(profile.email);
+  return override ? { ...profile, birth: override } : profile;
+}
+
 /** 화면 입력(예: "1995.05.20", "1995/05/20")을 서버가 요구하는 YYYY-MM-DD 형식으로
  * 바꿔줘요. 이미 하이픈 형식이거나 형식을 알아볼 수 없으면 원래 값을 그대로 둬서
  * 서버가 검증 메시지를 내려주도록 해요. */
@@ -110,6 +177,14 @@ function fromApiUser(apiUser: ApiUser, fallback: CustomerProfile): CustomerProfi
 
 type AuthContextValue = {
   isLoggedIn: boolean;
+  /** 앱이 막 켜져서 이 기기에 저장된 로그인 정보를 아직 확인 중이면 false예요.
+   * 이 값이 true가 되기 전까지는 isLoggedIn이 false여도 "진짜 로그아웃 상태"라고
+   * 단정하면 안 돼요(아직 확인 중일 뿐일 수 있어요). 계정별로 나뉘어 저장되는
+   * 데이터(예: 포인트·쿠폰)를 다루는 화면은 반드시 authReady가 true가 된 뒤에만
+   * isLoggedIn/profile 값을 신뢰해서 저장 위치를 정해야, 확인이 끝나기도 전에
+   * 잘못된(비로그인 취급) 위치에 데이터를 저장/이전해버리는 사고를 막을 수 있어요.
+   */
+  authReady: boolean;
   /** 회원가입 때 받은 정보 + 프로필 화면에서 직접 입력한 정보. 로그인 직후에는
    * 아직 서버에서 못 받아온 상태일 수 있어(profileLoading), 화면에서는 이를 참고해서
    * 로딩 표시를 해주면 좋아요. */
@@ -157,34 +232,45 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [authLoading, setAuthLoading] = useState(false);
   const [profile, setProfile] = useState<CustomerProfile>(EMPTY_PROFILE);
   const [profileLoading, setProfileLoading] = useState(false);
+  // ⚠️ isLoggedIn/profile의 초기값(false/빈 값)은 "아직 확인 전"이라는 뜻이지
+  // "실제로 로그아웃 상태"라는 뜻이 아니에요. 그런데 BenefitsProvider 등 다른
+  // 화면들은 이 값만 보고 "지금 로그인 상태가 맞다"고 판단해서, 실제로는
+  // 로그인돼 있는데도 이 초기값(false)을 잠깐이라도 "진짜 로그아웃 상태"로
+  // 오해하면 문제가 생길 수 있어요(예: 계정별 데이터를 잘못된 계정 칸에
+  // 저장/이전해버리는 것). authReady는 바로 아래 useEffect가 한 번 실행돼서
+  // isLoggedIn/profile이 "이 기기에 저장된 진짜 값"으로 바뀐 뒤에만 true가
+  // 되는 값이에요. 다른 화면은 authReady가 true가 되기 전까지는 isLoggedIn을
+  // 신뢰하지 말고 기다려야 해요.
+  const [authReady, setAuthReady] = useState(false);
 
   useEffect(() => {
-    setIsLoggedIn(Boolean(getCustomerToken()));
+    // ⚠️ 예전엔 이 useEffect가 setIsLoggedIn(true)를 호출한 뒤, 바로 아래에
+    // 있는 "서버에서 최신 프로필 받아오기" useEffect가 그 결과를 보고 동작하길
+    // 기대하면서 의존성 배열을 []로 뒀어요. 그런데 리액트에서 deps가 []인
+    // useEffect는 "맨 처음 렌더" 시점에 만들어진 함수(그 안의 isLoggedIn은
+    // 항상 초기값인 false)만 실행되고, setIsLoggedIn(true)로 인한 리렌더 이후엔
+    // 다시 실행되지 않아요. 그 결과 "서버에서 최신 프로필 받아오기" 코드가
+    // 사실상 한 번도 실행되지 않는 죽은 코드가 되어 있었어요(항상
+    // localStorage 캐시만 보여준 것). 그래서 두 로직을 하나의 useEffect로
+    // 합치고, state가 아니라 방금 읽은 실제 토큰 값(hasToken)을 기준으로
+    // 판단하도록 고쳤어요.
+    const hasToken = Boolean(getCustomerToken());
+    setIsLoggedIn(hasToken);
     const stored = readProfileStorage();
     if (stored) setProfile(stored);
-  }, []);
+    setAuthReady(true);
 
-  // 이미 로그인된 상태로 앱이 열렸을 때(새로고침 등) 서버에서 최신 프로필을 받아와요.
-  // 백엔드 연동 전(API 미설정)에는 기기에 저장해둔 값을 그대로 써요.
-  useEffect(() => {
-    if (!isLoggedIn || !isApiConfigured()) return;
+    // 이미 로그인된 상태로 앱이 열렸을 때(새로고침, 뒤로가기로 복귀 등) 서버에서
+    // 최신 프로필을 받아와요. 백엔드 연동 전(API 미설정)에는 기기에 저장해둔
+    // 값을 그대로 써요.
+    if (!hasToken || !isApiConfigured()) return;
     let cancelled = false;
     setProfileLoading(true);
     apiGetMe("customer")
       .then((apiUser) => {
         if (cancelled || !apiUser) return;
         setProfile((prev) => {
-          const next = fromApiUser(apiUser, prev);
-          // ⚠️ 저장 직후뿐 아니라, 앱을 새로고침/재실행해서 서버 프로필을
-          // 다시 받아올 때도 서버가 birth_date를 계속 null로 돌려주는 문제가
-          // 있어요. 이 기기에 이미 저장해둔 생년월일이 있는데 서버가 null을
-          // 주면, "서버가 몰라서 지운 것"과 "서버가 원래 이 필드를 잘
-          // 못 돌려주는 것"을 구분할 방법이 없으니 이 기기에 저장된 값을
-          // 계속 신뢰해요. 서버가 실제로 다른(진짜) 날짜를 주면 정상적으로
-          // 그 값이 반영돼요 — null을 줄 때만 무시해요.
-          if (apiUser.birth_date === null && prev.birth) {
-            next.birth = prev.birth;
-          }
+          const next = applyBirthOverride(fromApiUser(apiUser, prev));
           writeProfileStorage(next);
           return next;
         });
@@ -219,7 +305,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await apiCustomerLogin(email, password);
       setCustomerToken(res.token);
       setProfile((prev) => {
-        const next = fromApiUser(res.user, prev);
+        const next = applyBirthOverride(fromApiUser(res.user, prev));
         writeProfileStorage(next);
         return next;
       });
@@ -259,7 +345,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await apiSignup({ ...input, terms_accepted: true });
       setCustomerToken(res.token);
       setProfile(() => {
-        const next = fromApiUser(res.user, EMPTY_PROFILE);
+        const next = applyBirthOverride(fromApiUser(res.user, EMPTY_PROFILE));
         writeProfileStorage(next);
         return next;
       });
@@ -287,7 +373,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await apiSocialExchange(code, "customer");
       setCustomerToken(res.token);
       setProfile((prev) => {
-        const next = fromApiUser(res.user, prev);
+        const next = applyBirthOverride(fromApiUser(res.user, prev));
         writeProfileStorage(next);
         return next;
       });
@@ -350,6 +436,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             birth: birth ?? null,
             profileImageUrl: imageUrl,
           };
+          setBirthOverride(next.email, next.birth);
           writeProfileStorage(next);
           return next;
         });
@@ -385,6 +472,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             ...base,
             birth: normalizeBirthDate(birth ?? null),
           };
+          // 방금 성공적으로 저장한 생년월일을 이메일별 백업에도 반영해요.
+          // 서버가 이후 로그인 응답에서 다시 null을 내려주더라도(알려진
+          // 백엔드 이슈) 이 백업으로 되살릴 수 있어요.
+          setBirthOverride(next.email, next.birth);
           writeProfileStorage(next);
           return next;
         });
@@ -412,6 +503,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const value = useMemo<AuthContextValue>(
     () => ({
       isLoggedIn,
+      authReady,
       profile,
       profileLoading,
       login,
@@ -421,7 +513,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       authLoading,
       updateProfile,
     }),
-    [isLoggedIn, profile, profileLoading, authLoading]
+    [isLoggedIn, authReady, profile, profileLoading, authLoading]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

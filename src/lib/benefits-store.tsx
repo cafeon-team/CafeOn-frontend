@@ -6,6 +6,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { apiGetMyCoupons, apiGetMyMembership, isApiConfigured } from "@/lib/api";
@@ -66,7 +67,33 @@ type BenefitsState = {
   meta: BenefitsMeta;
 };
 
-const STORAGE_KEY = "cafeon_benefits_state_v1";
+/** 예전 버전에서 계정 구분 없이 쓰던 고정 키예요. 지금은 이 키를 "그대로"
+ * localStorage에 쓰지 않고, 아래 storageKeyFor()로 계정별 키를 만들어서 써요.
+ * (버그였던 옛날 데이터를 한 번만 이어받기 위한 마이그레이션 용도로만 남겨둬요.) */
+const STORAGE_KEY_PREFIX = "cafeon_benefits_state_v1";
+
+/**
+ * 로그인한 계정을 구분할 값을 만들어요.
+ * ------------------------------------------------------------------
+ * 예전 버그: 포인트·쿠폰을 저장하는 localStorage 키가
+ * "cafeon_benefits_state_v1" 하나로 고정돼 있어서, 같은 브라우저(기기)에서는
+ * 로그인한 계정이 무엇이든 같은 저장 칸을 공유했어요. 그래서 김길동 계정과
+ * 카페온 계정이 똑같은 포인트·생일 쿠폰을 보게 됐던 거예요.
+ *
+ * 고친 방법: 이메일(계정을 구분하는 유일한 값)을 저장 키에 포함시켜서,
+ * 계정마다 완전히 다른 localStorage 칸을 쓰게 했어요. 로그인 전이거나
+ * 이메일을 아직 못 받아온 경우엔 "guest" 칸을 써요(이 칸은 실제 혜택 지급
+ * 로직에서는 isLoggedIn 체크 때문에 어차피 쓰이지 않아요).
+ */
+function normalizeAccountId(email: string | null | undefined): string {
+  const trimmed = (email ?? "").trim().toLowerCase();
+  return trimmed || "guest";
+}
+
+/** 계정 ID로 실제 localStorage 키를 만들어요. 계정마다 완전히 다른 칸이에요. */
+function storageKeyFor(accountId: string): string {
+  return `${STORAGE_KEY_PREFIX}:${accountId}`;
+}
 
 const EMPTY_STATE: BenefitsState = {
   points: 0,
@@ -83,10 +110,10 @@ const EMPTY_STATE: BenefitsState = {
   },
 };
 
-function readState(): BenefitsState | null {
+function readState(key: string): BenefitsState | null {
   if (typeof window === "undefined") return null;
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     return {
@@ -99,10 +126,22 @@ function readState(): BenefitsState | null {
   }
 }
 
-function writeState(state: BenefitsState) {
+function writeState(key: string, state: BenefitsState) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    window.localStorage.setItem(key, JSON.stringify(state));
+  } catch {
+    // 시크릿 모드 등 localStorage를 못 쓰는 환경이면 조용히 무시해요.
+  }
+}
+
+/** 계정별 키로 나누기 전, 옛날 공용 키에 남아있던 데이터를 지워요. 이 기기에서
+ * 맨 처음 켜본 계정이 한 번 이어받고 나면 곧바로 지워서, 다른 계정이 또
+ * 그 데이터를 가져가지 못하게 해요. */
+function clearLegacyState() {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(STORAGE_KEY_PREFIX);
   } catch {
     // 시크릿 모드 등 localStorage를 못 쓰는 환경이면 조용히 무시해요.
   }
@@ -219,9 +258,15 @@ function readNumberField(obj: Record<string, unknown>, keys: string[]): number |
  * 값이 하나도 없는 "최초 1회"에만 GET /api/users/me/membership,
  * GET /api/users/me/coupons 값으로 시작해요. 그 이후로는 이 네 가지 혜택으로
  * 쌓인 값이 진짜 값이라 계속 로컬 기준으로 이어가요.
+ *
+ * ⚠️ localStorage 저장 칸은 로그인한 계정(이메일)마다 따로 나눠져 있어요
+ * (storageKeyFor 참고). 예전엔 "cafeon_benefits_state_v1"라는 고정된 키
+ * 하나만 써서, 같은 기기에서 계정을 바꿔 로그인해도 포인트·쿠폰(생일 쿠폰
+ * 포함)이 계속 똑같이 보이는 문제가 있었어요. 지금은 계정이 바뀌면(로그인/
+ * 로그아웃/다른 계정으로 로그인) 자동으로 그 계정 전용 칸을 다시 읽어와요.
  */
 export function BenefitsProvider({ children }: { children: ReactNode }) {
-  const { isLoggedIn, profile } = useAuth();
+  const { isLoggedIn, authReady, profile } = useAuth();
   const { orders } = useOrders();
   const { reviews } = useReviews();
 
@@ -230,32 +275,90 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
+  // 지금 어느 계정 칸에 읽고/쓰고 있는지를 기억해요. 아래 persist()와 다른
+  // useEffect들(신규가입/생일/주문/리뷰 적립)이 전부 이 값을 참고해서 저장하기
+  // 때문에, 계정이 바뀌면(로그인/로그아웃/다른 계정 로그인) 이 값도 곧바로
+  // 따라 바뀌어야 다른 계정의 저장 칸에 잘못 쓰는 일이 없어요.
+  const storageKeyRef = useRef<string>(storageKeyFor(normalizeAccountId(null)));
+
   const flashToast = (msg: string) => {
     setToastMsg(msg);
     setTimeout(() => setToastMsg((cur) => (cur === msg ? null : cur)), 2400);
   };
 
   const persist = (next: BenefitsState) => {
-    writeState(next);
+    writeState(storageKeyRef.current, next);
     return next;
   };
 
-  // 최초 1회: 이 기기에 저장된 값이 있으면 그대로 이어서 쓰고, 없으면(이
-  // 기기에서 처음 켜진 경우) 서버 값(연동돼 있으면)으로 시작해요.
+  // 계정(이메일)이 바뀔 때마다 다시 실행돼요: 로그인 직후, 로그아웃, 또는
+  // 같은 브라우저에서 다른 계정으로 다시 로그인했을 때 전부 포함돼요.
+  // ------------------------------------------------------------------
+  // 1) 이 계정 전용 저장 칸(cafeon_benefits_state_v1:이메일)에 값이 있으면
+  //    그대로 이어서 써요.
+  // 2) 없다면, 계정 구분이 없던 예전 버전 때문에 이 기기에 남아있을 수 있는
+  //    공용 데이터(cafeon_benefits_state_v1)를 딱 한 번만 이 계정에게
+  //    넘겨주고, 다른 계정이 또 가져가지 못하도록 바로 지워요.
+  // 3) 그마저도 없으면(이 기기에서 이 계정으로 처음 켠 경우) 서버 값(연동돼
+  //    있으면)으로 새로 시작해요.
+  //
+  // ⚠️ 이 효과는 반드시 authReady가 true가 된 뒤에만 실행해요. authReady가
+  // false인 동안의 isLoggedIn은 "실제 로그아웃 상태"가 아니라 "아직 이
+  // 기기의 로그인 정보를 확인하기 전"이에요. 예전엔 이 효과가 authReady를
+  // 기다리지 않고 곧바로 실행돼서(BenefitsProvider가 AuthGate 바깥,
+  // 즉 로그인 여부가 확정되기 "전"에 함께 마운트되는 구조라), 실제로는
+  // 로그인돼 있는 계정인데도 이 효과가 "아직 확인 전"인 isLoggedIn=false
+  // 값을 "guest"로 오해해서 예전 공용 데이터(생일·가입 쿠폰 등)를 엉뚱하게
+  // "guest" 칸으로 옮겨버리고 곧바로 지워버렸어요. 그 직후 authReady 없이도
+  // isLoggedIn이 뒤늦게 true로 바뀌면서 이 효과가 다시 실행됐지만, 이미
+  // 지워진 뒤라 진짜 계정 쪽에서는 쿠폰이 하나도 없는 것처럼(0장) 보였던
+  // 거예요. authReady를 기다리면 이 효과가 "확정된" 로그인 상태로 딱 한 번만
+  // 판단하기 때문에 이 사고가 재현되지 않아요.
   useEffect(() => {
+    if (!authReady) return;
     let cancelled = false;
-    const local = readState();
+    const accountId = normalizeAccountId(isLoggedIn ? profile.email : null);
+    const storageKey = storageKeyFor(accountId);
+    storageKeyRef.current = storageKey;
+
+    // 계정이 바뀌는 순간, 방금 전 계정의 포인트·쿠폰이 화면에 잠깐이라도
+    // 겹쳐 보이지 않도록 먼저 비워두고 이 계정의 데이터를 다시 불러와요.
+    setReady(false);
+    setState(EMPTY_STATE);
+
+    const local = readState(storageKey);
     if (local) {
       const fixed = reconcilePointLogs(local);
-      persist(fixed);
+      writeState(storageKey, fixed);
       setState(fixed);
       setReady(true);
       return;
     }
-    if (!isApiConfigured()) {
+
+    // ⚠️ 예전 공용 데이터를 이어받는 건 "확실히 로그인된 계정"일 때만
+    // 해요. 로그인하지 않은 상태(guest)에서는 이어받지도, 지우지도
+    // 않아요 — 이 상태에서 지워버리면 잠시 후 실제 계정으로 로그인했을
+    // 때 이어받을 데이터가 이미 사라진 뒤라 쿠폰이 0장으로 보이게 돼요.
+    if (isLoggedIn) {
+      const legacy = readState(STORAGE_KEY_PREFIX);
+      if (legacy) {
+        const fixed = reconcilePointLogs(legacy);
+        writeState(storageKey, fixed);
+        clearLegacyState();
+        setState(fixed);
+        setReady(true);
+        return;
+      }
+    }
+
+    if (!isApiConfigured() || !isLoggedIn) {
+      // 로그인 전이거나 백엔드 연동 전이면 서버 값을 받아올 수 없으니
+      // 빈 상태로 준비만 끝내요. 로그인하면(또는 연동되면) 이 효과가
+      // 다시 실행돼서 그때 다시 판단해요.
       setReady(true);
       return;
     }
+
     setLoading(true);
     Promise.all([apiGetMyMembership(), apiGetMyCoupons()])
       .then(([membership, coupons]) => {
@@ -278,7 +381,7 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
           // eslint-disable-next-line no-console
           console.info(`[benefits] 서버 membership.point(${p})는 적립 내역과 무관해 보유 포인트에 반영하지 않았어요.`);
         }
-        persist({ ...EMPTY_STATE, coupons: mapped });
+        writeState(storageKey, { ...EMPTY_STATE, coupons: mapped });
         setState({ ...EMPTY_STATE, coupons: mapped });
       })
       .finally(() => {
@@ -290,7 +393,7 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [authReady, isLoggedIn, profile.email]);
 
   // 1) 신규가입 쿠폰
   useEffect(() => {
