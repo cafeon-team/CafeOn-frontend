@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -15,15 +15,43 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // ⚠️ "Too Many Attempts." 대응: 백엔드가 429(요청 과다)로 로그인을 잠갔을 때,
+  // 남은 시간(초) 동안 로그인 버튼을 눌러도 아무 효과가 없는데도 계속 누를 수
+  // 있으면 서버 쪽 "시도 횟수"만 더 쌓여서 잠금이 더 길어져요. 그래서 여기서
+  // 카운트다운이 끝날 때까지 버튼 자체를 막아요.
+  const [cooldown, setCooldown] = useState(0);
+  const cooldownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+    };
+  }, []);
+
+  const startCooldown = (seconds: number) => {
+    if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+    setCooldown(seconds);
+    cooldownTimer.current = setInterval(() => {
+      setCooldown((prev) => {
+        if (prev <= 1) {
+          if (cooldownTimer.current) clearInterval(cooldownTimer.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
 
   const handleLogin = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    if (cooldown > 0) return;
     setError(null);
     const result = await login(email, password);
     if (result.ok) {
       router.push("/map");
     } else {
       setError(result.error);
+      if (result.retryAfterSeconds) startCooldown(result.retryAfterSeconds);
     }
   };
 
@@ -73,8 +101,12 @@ export default function LoginPage() {
         />
         {error && <p className="text-[13px] text-danger">{error}</p>}
         <div className="mt-2">
-          <Button type="submit" disabled={authLoading}>
-            {authLoading ? "로그인 중..." : "로그인"}
+          <Button type="submit" disabled={authLoading || cooldown > 0}>
+            {authLoading
+              ? "로그인 중..."
+              : cooldown > 0
+                ? `${cooldown}초 후 다시 시도`
+                : "로그인"}
           </Button>
         </div>
       </form>
@@ -94,14 +126,10 @@ export default function LoginPage() {
           <Circle size={16} className="fill-[#FEE500] text-[#FEE500]" />
           카카오로 로그인
         </button>
-        <button
-          type="button"
-          onClick={() => handleSocialLogin("naver")}
-          className="flex h-14 items-center justify-center gap-2 rounded-2xl border border-border bg-white text-[15px] font-medium text-ink"
-        >
-          <span className="font-extrabold text-[#03C75A]">N</span>
-          네이버로 로그인
-        </button>
+        {/* ⚠️ 2026-08-25: 네이버 로그인 버튼은 요청에 따라 화면에서만 잠시
+            뺐어요. handleSocialLogin("naver") 호출부와 api.ts의
+            SocialProvider="naver" 타입/로직은 그대로 남겨뒀으니, 나중에
+            네이버 로그인을 다시 켤 땐 이 버튼만 복원하면 돼요. */}
         <button
           type="button"
           onClick={() => handleSocialLogin("google")}

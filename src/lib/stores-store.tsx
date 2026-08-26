@@ -10,7 +10,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { type Cafe } from "@/lib/data";
+import { type Cafe, type SeatStatus } from "@/lib/data";
 import {
   apiListStores,
   apiGetStore,
@@ -23,7 +23,7 @@ import {
 } from "@/lib/api";
 import { usePathname } from "next/navigation";
 import { geocodeAddress } from "@/lib/kakao-map-sdk";
-import { congestionFromAvailability } from "@/lib/seat-congestion";
+import { CONGESTION_API_TO_LEVEL } from "@/lib/seat-congestion";
 
 type StoresContextValue = {
   /** 지도/검색/찜 목록에서 공통으로 쓰는 카페(매장) 목록.
@@ -42,11 +42,12 @@ type StoresContextValue = {
 
 const StoresContext = createContext<StoresContextValue | null>(null);
 
-// ⚠️ 2026-08-25: 서버 congestion 라벨(RELAXED/BUSY 등)을 그대로 믿는 대신,
-// 같은 응답에 들어있는 실제 좌석 숫자(available_capacity/total_capacity)로
-// 우리가 직접 등급을 계산해요(congestionFromAvailability). 실제 확인해보니
-// 백엔드의 congestion 라벨이 남은 좌석 비율과 반대로 나오는 경우가 있었어요
-// (자세한 내용은 seat-congestion.ts의 congestionFromAvailability 설명 참고).
+// ⚠️ 예전엔 이 매핑을 여기서 따로 정의했는데, 사장님 화면(owner-store.tsx)은
+// 서버 값 대신 좌석 수로 직접 계산하는 별도 로직을 써서 두 화면이 다른 값을
+// 보여줬어요. 이제 손님/사장님 화면 모두 seat-congestion.ts의 이 매핑
+// 하나만 사용해서 항상 같은 값을 보여줘요.
+const CONGESTION_TO_STATUS: Record<ApiAvailability["congestion"], SeatStatus> =
+  CONGESTION_API_TO_LEVEL;
 
 const KNOWN_AMENITY_SLUGS = ["wifi", "outlet", "parking", "pet"] as const;
 
@@ -121,7 +122,7 @@ export function mapStoreToCafe(
     reviewCount: rating?.reviewCount ?? 0,
     distance: "-",
     status: availability
-      ? congestionFromAvailability(availability)
+      ? CONGESTION_TO_STATUS[availability.congestion]
       : "여유",
     seatsFilled: availability?.occupied_capacity ?? 0,
     seatsTotal: availability?.total_capacity ?? 0,
@@ -215,29 +216,49 @@ export function StoresProvider({ children }: { children: ReactNode }) {
     setLoading(true);
 
     apiListStores()
-      .then(async (stores) => {
-        if (cancelled || !stores) return;
+      .then((stores) => {
+        if (cancelled) return;
+        if (!stores) {
+          setLoading(false);
+          return;
+        }
+        // ⚠️ 예전엔 매장 목록(GET /api/stores)을 받아온 뒤에도, 매장마다
+        // 혼잡도·별점을 "전부" 조회(Promise.all, 매장 수 × 2개 요청)해서
+        // 그게 다 끝나야 화면에 카페가 하나라도 보였어요. 개발 백엔드가
+        // 요청을 한 번에 하나씩만 처리하다 보니(위 주석 참고), 매장이
+        // 조금만 많아도 "카페 정보를 불러오는 데 너무 오래 걸린다"는
+        // 문제로 바로 이어졌어요. 이제 매장 목록은 받아오는 즉시 먼저
+        // 화면에 보여주고(별점 0·기본 혼잡도로 시작), 혼잡도·별점은 매장
+        // 하나가 준비될 때마다 그 카드만 채워 넣어요 — 전체를 기다리지
+        // 않아도 목록이 즉시 뜨고, 나머지는 눈에 보이며 순서대로 채워져요.
+        const mapped = stores.map((s) => mapStoreToCafe(s));
+        setCafes(mapped);
+        setIsMock(false);
+        setLoading(false);
+
+        // 주소만 있고 좌표가 없는 매장은 여기서 클라이언트 지오코딩으로 보완해요.
+        stores.forEach((s) => geocodeCafeIfNeeded(s, setCafes, () => cancelled));
+
         // ⚠️ GET /api/stores는 평균 별점을 안 내려줘서, 예전엔 지도/검색/찜
         // 목록의 별점이 항상 0으로 고정돼 보였어요(리뷰가 실제로 달려도 반영
         // 안 됨). 카페 상세 화면과 똑같이 매장별 리뷰를 불러와서 평균 별점·
-        // 리뷰 수를 직접 계산해요.
-        const [availabilities, ratings] = await Promise.all([
-          Promise.all(stores.map((s) => apiGetStoreCongestion(s.id))),
-          Promise.all(stores.map((s) => apiGetStoreRating(s.id))),
-        ]);
-        if (cancelled) return;
-        const mapped = stores.map((s, i) =>
-          mapStoreToCafe(s, availabilities[i], undefined, ratings[i]),
-        );
-        setCafes(mapped);
-        setIsMock(false);
-
-        // 주소만 있고 좌표가 없는 매장은 여기서 클라이언트 지오코딩으로 보완해요.
-        stores.forEach((s) =>
-          geocodeCafeIfNeeded(s, setCafes, () => cancelled),
-        );
+        // 리뷰 수를 직접 계산해요. 매장별로 개별 호출하고, 도착하는 대로
+        // 그 매장 카드만 갱신해요(전체를 한 덩어리로 기다리지 않아요).
+        stores.forEach((s) => {
+          const id = String(s.id);
+          Promise.all([apiGetStoreCongestion(s.id), apiGetStoreRating(s.id)]).then(
+            ([availability, rating]) => {
+              if (cancelled) return;
+              setCafes((prev) =>
+                prev.map((c) =>
+                  c.id === id ? mapStoreToCafe(s, availability, undefined, rating) : c,
+                ),
+              );
+            },
+          );
+        });
       })
-      .finally(() => {
+      .catch(() => {
         if (!cancelled) setLoading(false);
       });
 
@@ -274,7 +295,7 @@ export function StoresProvider({ children }: { children: ReactNode }) {
               if (!availability) return c;
               return {
                 ...c,
-                status: congestionFromAvailability(availability),
+                status: CONGESTION_TO_STATUS[availability.congestion],
                 seatsFilled: availability.occupied_capacity,
                 seatsTotal: availability.total_capacity,
                 updatedAgo: formatUpdatedAgo(

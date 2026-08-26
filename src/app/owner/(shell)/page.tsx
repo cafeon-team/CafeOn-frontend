@@ -26,6 +26,7 @@ export default function OwnerHomePage() {
     todaySales,
     salesChangePct,
     todaySalesByHour,
+    salesLoading,
     salesError,
   } = useOwner();
 
@@ -75,11 +76,12 @@ export default function OwnerHomePage() {
           <p className="text-[14px] font-medium text-ink-muted">오늘 매출</p>
           <div className="mt-1 flex items-center justify-between gap-2">
             <div className="min-w-0">
-              {/* 8초마다 매출을 다시 불러오는 동안(salesLoading) 숫자가 반투명
-                  →불투명을 반복해서 "깜빡거리는" 것처럼 보였어요. 로딩 중에도
-                  항상 완전히 불투명한 검정 글씨로 고정해서 깜빡임 없이 값만
-                  조용히 바뀌도록 했어요. */}
-              <p className="whitespace-nowrap text-[26px] font-extrabold text-black">
+              <p
+                className={
+                  "whitespace-nowrap text-[26px] font-extrabold text-ink transition-opacity " +
+                  (salesLoading ? "opacity-50" : "opacity-100")
+                }
+              >
                 {todaySales.toLocaleString()}원
               </p>
               <p className="mt-1 flex items-center gap-1 text-[13px] font-bold text-sage-dark">

@@ -3,90 +3,28 @@
 import { useEffect, useMemo, useState } from "react";
 import { Armchair } from "lucide-react";
 import Header from "@/components/Header";
-import { useOwner, type OwnerSeat } from "@/lib/owner-store";
+import { useOwner, sortSeatsByNumber, type OwnerSeat } from "@/lib/owner-store";
 import { congestionStyle, remainingMessage } from "@/lib/seat-congestion";
-
-/** 좌석을 화면에 보여줄 순서로 정렬해요.
- * ⚠️ 예전엔 서버가 내려준 라벨(seat_name)을 숫자로 바꿔서 그 값으로
- * 정렬했는데, seat_name이 서버에 제대로 저장되지 않은 좌석은 seat_code
- * (예: "S1a2b3" 같은 임의 문자열)가 라벨로 대신 쓰이면서 정렬 기준 자체가
- * 뒤죽박죽돼 "1, 2, 3..." 순서가 아니라 좌석이 뒤섞여(사실상 랜덤하게)
- * 보이는 문제가 있었어요. 라벨 텍스트는 더 이상 정렬/번호 매기기에 쓰지
- * 않고, 서버가 매긴 좌석 id(대부분 만든 순서대로 커지는 값)로만 정렬해요.
- * 아직 서버 응답을 기다리는 새 좌석(id가 "seat-"로 시작하는 임시값)은
- * 화면에 추가된 순서를 그대로 유지해요. */
-function sortSeatsForDisplay(seats: OwnerSeat[]) {
-  return seats
-    .map((seat, index) => ({ seat, index }))
-    .sort((a, b) => {
-      const aTemp = a.seat.id.startsWith("seat-");
-      const bTemp = b.seat.id.startsWith("seat-");
-      const na = Number(a.seat.id);
-      const nb = Number(b.seat.id);
-      const aIsNum = !aTemp && Number.isFinite(na);
-      const bIsNum = !bTemp && Number.isFinite(nb);
-      if (aIsNum && bIsNum) return na - nb;
-      if (aIsNum) return -1;
-      if (bIsNum) return 1;
-      // 둘 다 임시(또는 둘 다 숫자가 아닌) 좌석이면 추가된 순서를 유지해요.
-      return a.index - b.index;
-    })
-    .map(({ seat }) => seat);
-}
 
 export default function OwnerStorePage() {
   const {
     seats,
     congestion,
     setSeatStatus,
-    addSeatsBatch,
-    removeSeatsBatch,
+    seatSyncError,
     seatsLoading,
     seatsLoadFailed,
     seatsResetting,
+    seatsBatchBusy,
+    applySeatsTotal,
     retrySeatsLoad,
   } = useOwner();
   const [setupCount, setSetupCount] = useState("");
 
-  const sortedSeats = useMemo(() => sortSeatsForDisplay(seats), [seats]);
+  const sortedSeats = useMemo(() => sortSeatsByNumber(seats), [seats]);
   const total = seats.length;
   const occupied = seats.filter((s) => s.status !== "비어있음").length;
   const remaining = total - occupied;
-
-  /** 총 좌석 수를 원하는 값으로 직접 맞춰요(맨 위 "전체 좌석 수" 입력칸에 새
-   * 숫자를 넣고 확정하면 호출돼요).
-   * ⚠️ 여러 석을 한 번에 조정할 수 있어야 해서, 새로 추가할 좌석 번호와
-   * 제거할 좌석 목록을 이 함수 안에서 한 번에 미리 계산해요.
-   * ⚠️ 예전엔 addSeat/removeSeat을 반복문 안에서 하나씩 await하며 불렀어요
-   * (앞 좌석의 서버 응답이 돌아온 "다음에야" 다음 좌석을 화면에 추가/삭제).
-   * 그래서 20 → 30처럼 크게 늘릴 때: 확정한 순간엔 "전체 좌석 수"가 아직
-   * 옛 숫자 그대로였다가, 좌석이 서버 왕복 속도에 맞춰 한 칸씩 느리게
-   * 늘어나며 한참 뒤에야 30이 되는 것처럼 보였어요. 이제 addSeatsBatch /
-   * removeSeatsBatch가 화면(숫자·그리드)은 호출 즉시 목표 개수만큼 전부
-   * 반영하고, 서버 저장·삭제만 뒤에서 개발용 백엔드가 감당할 수 있게
-   * 순서대로(하나씩) 이어가요 — 화면은 빠르고, 서버 요청은 여전히 안전해요. */
-  const applyTotalTarget = (rawNewTotal: number) => {
-    const newTotal = Math.max(0, Math.round(rawNewTotal));
-    if (!Number.isFinite(newTotal) || newTotal === total) return;
-
-    if (newTotal > total) {
-      // 새 좌석은 항상 "비어있음" 상태로, 현재 가장 큰 번호 다음부터 순서대로 추가해요.
-      const numericLabels = seats.map((s) => Number(s.label)).filter((n) => Number.isFinite(n));
-      let nextLabel = Math.max(total, numericLabels.length > 0 ? Math.max(...numericLabels) : 0);
-      const addCount = newTotal - total;
-      const newLabels = Array.from({ length: addCount }, () => String(++nextLabel));
-      addSeatsBatch(newLabels);
-      return;
-    }
-
-    // 줄일 때: 비어있는 좌석 중 번호가 큰 것부터 먼저 없애고, 그래도 목표에
-    // 못 미치면(전부 사용 중이면) 사용 중인 좌석도 번호가 큰 것부터 없애요.
-    const removeCount = total - newTotal;
-    const emptyDesc = sortedSeats.filter((s) => s.status === "비어있음").slice().reverse();
-    const occupiedDesc = [...sortedSeats].reverse().filter((s) => s.status !== "비어있음");
-    const removalOrder = [...emptyDesc, ...occupiedDesc].slice(0, removeCount);
-    removeSeatsBatch(removalOrder.map((s) => s.id));
-  };
 
   // 맨 위 "전체 좌석 수"는 평소엔 숫자만 보여주다가, 탭하면 그 자리에서 바로
   // 수정할 수 있는 입력칸으로 바뀌어요. 서버에서 좌석 수가 바뀌어 들어오면
@@ -101,25 +39,36 @@ export default function OwnerStorePage() {
     setTotalDraft(String(total));
     setEditingTotal(true);
   };
+  // ⚠️ 좌석을 여러 개 한꺼번에 추가/삭제할 때(총 좌석 수 조정) 서버 요청을
+  // 순서대로(직렬로) 처리해야 번호가 꼬이지 않아요 — 자세한 이유는
+  // owner-store.tsx의 applySeatsTotal 주석 참고. 그 처리가 끝나기 전까지는
+  // (seatsBatchBusy) 여기서 새로 조정 요청을 보내지 않아요.
   const commitEditTotal = () => {
     setEditingTotal(false);
+    if (seatsBatchBusy) return;
     const n = Number(totalDraft);
-    if (Number.isFinite(n) && n >= 0) applyTotalTarget(n);
+    if (Number.isFinite(n) && n >= 0) void applySeatsTotal(n);
   };
 
   const handleSetup = () => {
+    if (seatsBatchBusy) return;
     const n = Number(setupCount);
     if (!Number.isFinite(n) || n <= 0) return;
-    // 좌석을 한꺼번에 여러 개(예: 12개) 만들 때도 applyTotalTarget과 같은
-    // 방식이에요 — 그리드는 즉시 n개로 다 보이고, 서버 저장만 뒤에서
-    // 개발용 백엔드가 감당할 수 있게 하나씩 순서대로 진행돼요.
-    addSeatsBatch(Array.from({ length: n }, (_, i) => String(i + 1)));
+    void applySeatsTotal(n);
     setSetupCount("");
   };
 
   /** 좌석 하나를 탭하면 바로 상태가 바뀌어요 — 별도 "확인" 저장 단계 없이
-   * 비어있음 ↔ 사용중을 즉시 토글해요. */
+   * 비어있음 ↔ 사용중을 즉시 토글해요.
+   * ⚠️ 총 좌석 수를 조정하는 중(seatsBatchBusy)이거나 초기화하는 중
+   * (seatsResetting)에는 좌석 칸이 실시간으로 늘어나거나 사라지면서 화면
+   * 배치가 계속 바뀌어요. 이 동안 좌석 칸이 계속 클릭 가능한 상태로 남아있으면,
+   * 사용자가 같은 자리를 다시 누르는 순간 그 자리에 다른 좌석이 들어와 있어서
+   * "누른 적 없는 좌석"이 한꺼번에 토글되고, 그 상태변경 요청들이 지금 한창
+   * 진행 중인 추가/삭제 요청과 겹치면서 저장 실패("좌석 상태 저장에 실패했어요")
+   * 경고까지 함께 뜨는 문제로 이어졌어요. 조정이 끝날 때까지는 탭을 무시해요. */
   const toggleSeat = (seat: OwnerSeat) => {
+    if (seatsBatchBusy || seatsResetting || seatsLoading) return;
     setSeatStatus(seat.id, seat.status === "비어있음" ? "사용중" : "비어있음");
   };
 
@@ -127,12 +76,29 @@ export default function OwnerStorePage() {
     <div className="flex flex-col">
       <Header title="좌석 관리" />
 
+      {/* 저장이 서버에 실패하면(주로 백엔드 주소에 접속이 안 될 때) 화면이
+          조용히 원래대로 되돌아가는 대신 이유를 알려줘요. */}
+      {seatSyncError && (
+        <div className="mx-6 mt-4 rounded-xl bg-danger-tint px-4 py-3 text-[13px] font-medium text-danger">
+          {seatSyncError}
+        </div>
+      )}
+
       {/* 초기화(전체 삭제) 요청이 서버 응답을 기다리는 중이에요. 이 동안엔
           "총 좌석 수"가 실제로 몇 개인지 아직 확정되지 않았기 때문에, 화면이
           섣불리 0개로 바뀌며 "좌석 만들기"를 보여주지 않아요. */}
       {seatsResetting && (
         <div className="mx-6 mt-4 rounded-xl bg-amber-tint px-4 py-3 text-[13px] font-medium text-amber-dark">
           좌석을 초기화하는 중이에요. 서버 응답을 기다리는 동안 잠시만 기다려주세요...
+        </div>
+      )}
+
+      {/* 총 좌석 수 조정(추가/삭제)이 서버와 순서대로 처리되는 중이에요. 이
+          동안 다시 숫자를 바꾸면 아직 처리 중인 이전 변경과 겹쳐 좌석 번호가
+          꼬일 수 있어서, 끝날 때까지 입력을 잠깐 막아요. */}
+      {seatsBatchBusy && (
+        <div className="mx-6 mt-4 rounded-xl bg-amber-tint px-4 py-3 text-[13px] font-medium text-amber-dark">
+          좌석 수를 반영하는 중이에요. 잠시 후 다시 시도해주세요...
         </div>
       )}
 
@@ -171,13 +137,15 @@ export default function OwnerStorePage() {
               type="number"
               min={1}
               value={setupCount}
+              disabled={seatsBatchBusy}
               onChange={(e) => setSetupCount(e.target.value)}
               placeholder="예: 12"
-              className="h-12 flex-1 rounded-xl border border-border bg-white px-4 text-[14.5px] text-ink outline-none focus:border-trust"
+              className="h-12 flex-1 rounded-xl border border-border bg-white px-4 text-[14.5px] text-ink outline-none focus:border-trust disabled:opacity-60"
             />
             <button
               onClick={handleSetup}
-              className="h-12 shrink-0 rounded-xl bg-trust px-5 text-[14.5px] font-bold text-white"
+              disabled={seatsBatchBusy}
+              className="h-12 shrink-0 rounded-xl bg-trust px-5 text-[14.5px] font-bold text-white disabled:opacity-60"
             >
               좌석 만들기
             </button>
@@ -216,7 +184,8 @@ export default function OwnerStorePage() {
               ) : (
                 <button
                   onClick={startEditTotal}
-                  className="rounded-lg px-1.5 py-0.5 text-[20px] font-extrabold text-trust"
+                  disabled={seatsBatchBusy}
+                  className="rounded-lg px-1.5 py-0.5 text-[20px] font-extrabold text-trust disabled:opacity-60"
                 >
                   {total}석
                 </button>
@@ -273,28 +242,23 @@ export default function OwnerStorePage() {
             좌석을 탭하면 상태가 바로 바뀌어요. 변경 내용은 실시간으로 반영돼요.
           </p>
 
-          {/* 좌석 칸: 크게, 눌러서 즉시 토글.
-              화면에 보이는 번호는 seat.label(서버 라벨) 대신 정렬된 순서
-              (index + 1)를 그대로 써요 — 라벨이 어떤 값이든 항상 1, 2, 3...
-              순서대로만 보이게 하기 위해서예요. */}
+          {/* 좌석 칸: 크게, 눌러서 즉시 토글 */}
           <div className="grid grid-cols-4 gap-3">
-            {sortedSeats.map((seat, index) => {
-              const displayNumber = index + 1;
-              return (
-                <button
-                  key={seat.id}
-                  type="button"
-                  onClick={() => toggleSeat(seat)}
-                  aria-label={`좌석 ${displayNumber} · ${seat.status} · 눌러서 상태 변경`}
-                  className={
-                    "flex aspect-square items-center justify-center rounded-2xl text-[22px] font-extrabold text-white shadow-sm transition active:scale-95 " +
-                    (seat.status === "비어있음" ? "bg-sage" : "bg-danger")
-                  }
-                >
-                  {displayNumber}
-                </button>
-              );
-            })}
+            {sortedSeats.map((seat) => (
+              <button
+                key={seat.id}
+                type="button"
+                onClick={() => toggleSeat(seat)}
+                disabled={seatsBatchBusy || seatsResetting || seatsLoading}
+                aria-label={`좌석 ${seat.label} · ${seat.status} · 눌러서 상태 변경`}
+                className={
+                  "flex aspect-square items-center justify-center rounded-2xl text-[22px] font-extrabold text-white shadow-sm transition active:scale-95 disabled:opacity-50 disabled:active:scale-100 " +
+                  (seat.status === "비어있음" ? "bg-sage" : "bg-danger")
+                }
+              >
+                {seat.label}
+              </button>
+            ))}
           </div>
         </div>
       )}
