@@ -57,6 +57,10 @@ type BenefitsMeta = {
 
 type BenefitsState = {
   points: number;
+  /** 지금까지 "포인트 사용"으로 실제 차감된 총량. points는 항상
+   * "적립 내역 합계 - spent"로 계산되는 값이라, 보유 포인트 화면에 보이는
+   * 숫자와 적립 내역 목록이 서로 어긋나는 일이 없어요. */
+  spent: number;
   coupons: BenefitCoupon[];
   pointLogs: PointLogEntry[];
   meta: BenefitsMeta;
@@ -66,6 +70,7 @@ const STORAGE_KEY = "cafeon_benefits_state_v1";
 
 const EMPTY_STATE: BenefitsState = {
   points: 0,
+  spent: 0,
   coupons: [],
   pointLogs: [],
   meta: {
@@ -117,8 +122,8 @@ function addDaysKey(base: Date, days: number): string {
   return dateKey(d);
 }
 
-/** 주문을 완료할 때마다 정액으로 100P를 적립해요(결제 금액과 무관). */
-const ORDER_COMPLETE_POINT = 100;
+/** 주문을 완료할 때마다 정액으로 50P를 적립해요(결제 금액과 무관, 리뷰 작성 적립과 동일). */
+const ORDER_COMPLETE_POINT = 50;
 function computeOrderPoints(amount: number): number {
   if (!amount || amount <= 0) return 0;
   return ORDER_COMPLETE_POINT;
@@ -128,6 +133,48 @@ const REVIEW_BASE_POINT = 50;
 const REVIEW_PHOTO_BONUS = 50;
 const SIGNUP_COUPON_VALID_DAYS = 30;
 const BIRTHDAY_COUPON_VALID_DAYS = 7;
+
+function sumLogAmounts(logs: PointLogEntry[]): number {
+  return logs.reduce((sum, log) => sum + log.amount, 0);
+}
+
+/** 보유 포인트는 항상 "적립 내역 합계 - 사용한 포인트"로 다시 계산해요.
+ * 이렇게 하면 화면에 보이는 보유 포인트 숫자가 그 아래 적립 내역 목록과
+ * 절대 어긋날 수 없어요(예: 목록엔 50P+50P만 있는데 보유 포인트는 660P처럼
+ * 나오는 일이 없어져요). */
+function derivePoints(state: BenefitsState): number {
+  return Math.max(0, sumLogAmounts(state.pointLogs) - state.spent);
+}
+
+/**
+ * 예전에 저장돼 있던 포인트 적립 내역 중, 지금 적립 규칙
+ * (REVIEW_BASE_POINT / REVIEW_PHOTO_BONUS / ORDER_COMPLETE_POINT)과 다른
+ * 금액으로 남아있는 게 있으면 지금 규칙에 맞게 바로잡아요. 그 다음 보유
+ * 포인트를 적립 내역 합계 기준으로 다시 계산해서, 예전 버전에서 잘못
+ * 쌓였거나 남아있던 원인 모를 "숨은 포인트"까지 전부 정리해요.
+ * ------------------------------------------------------------------
+ * 예를 들어 "커피엔 방앗간 주문 완료 적립" 내역이 지금 규칙(50P)과
+ * 다른 금액(예: 280P나 100P)으로 남아있고, 보유 포인트도 적립 내역
+ * 목록에는 없는 금액(예: 660P)까지 섞여서 부풀려져 있던 문제를
+ * 화면을 켤 때마다 이 함수가 한 번에 바로잡아줘요.
+ */
+function reconcilePointLogs(state: BenefitsState): BenefitsState {
+  const fixedLogs = state.pointLogs.map((log) => {
+    let expected: number | null = null;
+    if (log.id.startsWith("order-")) {
+      expected = ORDER_COMPLETE_POINT;
+    } else if (log.id.startsWith("review-")) {
+      const hasPhotoBonus = log.reason.includes("포토리뷰");
+      expected = hasPhotoBonus ? REVIEW_BASE_POINT + REVIEW_PHOTO_BONUS : REVIEW_BASE_POINT;
+    }
+    if (expected !== null && log.amount !== expected) {
+      return { ...log, amount: expected };
+    }
+    return log;
+  });
+  const next = { ...state, pointLogs: fixedLogs };
+  return { ...next, points: derivePoints(next) };
+}
 
 type BenefitsContextValue = {
   points: number;
@@ -199,7 +246,9 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     const local = readState();
     if (local) {
-      setState(local);
+      const fixed = reconcilePointLogs(local);
+      persist(fixed);
+      setState(fixed);
       setReady(true);
       return;
     }
@@ -222,8 +271,15 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
           const used = Boolean(row["used_at"] ?? row["is_used"] ?? false);
           return { id, title, subtitle, valueLabel, used, kind: "general" as const };
         });
-        persist({ ...EMPTY_STATE, points: p ?? 0, coupons: mapped });
-        setState({ ...EMPTY_STATE, points: p ?? 0, coupons: mapped });
+        // 보유 포인트는 적립 내역(리뷰/주문 적립) 합계로만 계산해요. 서버
+        // 회원 정보의 point 값은 적립 내역과 짝지을 수 있는 근거가 없어서
+        // 보유 포인트에 섞지 않아요(대신 필요하면 그대로 로그로 남겨요).
+        if (p) {
+          // eslint-disable-next-line no-console
+          console.info(`[benefits] 서버 membership.point(${p})는 적립 내역과 무관해 보유 포인트에 반영하지 않았어요.`);
+        }
+        persist({ ...EMPTY_STATE, coupons: mapped });
+        setState({ ...EMPTY_STATE, coupons: mapped });
       })
       .finally(() => {
         if (!cancelled) {
@@ -338,15 +394,16 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
           });
         }
       }
-      return persist({
+      const nextLogs = [...logs, ...prev.pointLogs].slice(0, 50);
+      const nextState = {
         ...prev,
-        points: prev.points + addedPoints,
-        pointLogs: [...logs, ...prev.pointLogs].slice(0, 50),
+        pointLogs: nextLogs,
         meta: {
           ...prev.meta,
           orderPointsAwarded: [...prev.meta.orderPointsAwarded, ...newlyCompleted.map((o) => o.id)],
         },
-      });
+      };
+      return persist({ ...nextState, points: derivePoints(nextState) });
     });
     if (addedPoints > 0) flashToast(`✅ 주문 완료로 ${addedPoints.toLocaleString()}P가 적립됐어요!`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -382,15 +439,16 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
           createdAt: dateKey(new Date()),
         });
       }
-      return persist({
+      const nextLogs = [...logs, ...prev.pointLogs].slice(0, 50);
+      const nextState = {
         ...prev,
-        points: prev.points + addedPoints,
-        pointLogs: [...logs, ...prev.pointLogs].slice(0, 50),
+        pointLogs: nextLogs,
         meta: {
           ...prev.meta,
           reviewPointsAwarded: [...prev.meta.reviewPointsAwarded, ...newlyWritten.map((r) => r.id)],
         },
-      });
+      };
+      return persist({ ...nextState, points: derivePoints(nextState) });
     });
     if (addedPoints > 0) flashToast(`✅ 리뷰 작성으로 ${addedPoints.toLocaleString()}P가 적립됐어요!`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -403,7 +461,10 @@ export function BenefitsProvider({ children }: { children: ReactNode }) {
       pointLogs: state.pointLogs,
       loading,
       usePoints: (amount) =>
-        setState((prev) => persist({ ...prev, points: Math.max(0, prev.points - amount) })),
+        setState((prev) => {
+          const nextState = { ...prev, spent: prev.spent + amount };
+          return persist({ ...nextState, points: derivePoints(nextState) });
+        }),
       useCoupon: (id) =>
         setState((prev) =>
           persist({
