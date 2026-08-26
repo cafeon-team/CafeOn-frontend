@@ -175,6 +175,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (cancelled || !apiUser) return;
         setProfile((prev) => {
           const next = fromApiUser(apiUser, prev);
+          // ⚠️ 저장 직후뿐 아니라, 앱을 새로고침/재실행해서 서버 프로필을
+          // 다시 받아올 때도 서버가 birth_date를 계속 null로 돌려주는 문제가
+          // 있어요. 이 기기에 이미 저장해둔 생년월일이 있는데 서버가 null을
+          // 주면, "서버가 몰라서 지운 것"과 "서버가 원래 이 필드를 잘
+          // 못 돌려주는 것"을 구분할 방법이 없으니 이 기기에 저장된 값을
+          // 계속 신뢰해요. 서버가 실제로 다른(진짜) 날짜를 주면 정상적으로
+          // 그 값이 반영돼요 — null을 줄 때만 무시해요.
+          if (apiUser.birth_date === null && prev.birth) {
+            next.birth = prev.birth;
+          }
           writeProfileStorage(next);
           return next;
         });
@@ -358,24 +368,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           birth_date: normalizeBirthDate(birth ?? null),
         });
         setProfile((prev) => {
-          // ⚠️ 진짜 원인을 찾았어요: 백엔드 PUT /api/users/me 응답(updated)이
-          // 성공(200)이어도 응답 바디에 birth_date 필드를 아예 안 담아 돌려줄 때가
-          // 있어요. fromApiUser()는 필드가 "없으면"(undefined) 예전 값(prev)으로
-          // 되돌리는데, 여기서 prev로 "저장하기 누르기 전의 예전 profile"이
-          // 들어가면 방금 성공적으로 저장한 생년월일이 화면에서 다시 빈 값으로
-          // 돌아가버려요(저장 토스트는 뜨지만 몇 초 뒤/다른 화면 갔다오면 사라진
-          // 것처럼 보이는 버그의 진짜 원인이었어요). 그래서 prev 대신, 방금 이
-          // 요청으로 "성공했다고 가정할 수 있는" 값(optimisticNext)을 기본값으로
-          // 넘겨요 — 서버가 실제로 다른 값을 돌려주면(요청이 일부 거부된 경우)
-          // 그 값이 우선하고, 필드가 아예 없을 때만 방금 저장 성공한 값을 써요.
-          const optimisticNext: CustomerProfile = {
-            ...prev,
-            name,
-            phone: phone ?? null,
+          // ⚠️ 지난 수정(필드가 "아예 없을 때만" 예전 값 대신 쓰기)으로도 이 문제가
+          // 다시 재발했어요. 원인을 더 파보니, 서버가 필드를 아예 안 주는 게
+          // 아니라 birth_date: null 이라고 "명시적으로" 돌려주고 있었어요. null은
+          // JS에서 undefined가 아니라서, "필드가 없을 때만" 예전 값 대신 쓰는
+          // 이전 로직은 이 경우를 못 잡았어요 — 서버가 준 explicit null이 그대로
+          // 이겨서 방금 저장한 생년월일이 다시 사라졌던 거예요.
+          //
+          // 그래서 이제 birth_date는 서버 응답을 아예 신뢰하지 않아요. PUT
+          // 요청이 예외 없이 성공했다면(이 catch 블록까지 안 왔다면) 우리가 보낸
+          // 값 그대로 화면에 반영해요. 만약 서버가 생년월일 값 자체를 문제
+          // 삼았다면(미래 날짜 등) 애초에 요청 전체가 422로 실패해서 아래
+          // catch 블록으로 빠지지, 여기까지 200으로 오지 않으니 안전해요.
+          const base = fromApiUser(updated, prev);
+          const next: CustomerProfile = {
+            ...base,
             birth: normalizeBirthDate(birth ?? null),
-            profileImageUrl: nextImageUrl,
           };
-          const next: CustomerProfile = fromApiUser(updated, optimisticNext);
           writeProfileStorage(next);
           return next;
         });
