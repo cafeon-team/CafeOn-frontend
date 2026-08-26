@@ -5,7 +5,9 @@ import Link from "next/link";
 import { ChevronRight } from "lucide-react";
 import Header from "@/components/Header";
 import StarRating from "@/components/StarRating";
+import ImagePlaceholder from "@/components/ImagePlaceholder";
 import { useReviews } from "@/lib/reviews-store";
+import { resolveImageUrl } from "@/lib/api";
 
 export default function MyReviewsPage() {
   const { reviews, removeReview } = useReviews();
@@ -40,6 +42,22 @@ export default function MyReviewsPage() {
                 <button onClick={() => setConfirmDeleteId(r.id)}>삭제</button>
               </div>
             </div>
+            {/* 리뷰 작성/수정 화면에서 첨부한 사진을 여기서도 보여줘요. 카페 상세
+                화면의 리뷰 탭과 같은 방식(ImagePlaceholder + resolveImageUrl)으로
+                썸네일을 그려요. */}
+            {(r.images?.length ?? 0) > 0 && (
+              <div className="mt-3 flex gap-2 overflow-x-auto">
+                {r.images!.map((src, i) => (
+                  <ImagePlaceholder
+                    key={`${src}-${i}`}
+                    className="h-16 w-16 shrink-0"
+                    iconSize={14}
+                    src={resolveImageUrl(src)}
+                    alt={`리뷰 사진 ${i + 1}`}
+                  />
+                ))}
+              </div>
+            )}
           </div>
         ))}
       </div>

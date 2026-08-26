@@ -887,6 +887,69 @@ export function extractReviewImageUrls(
     .filter((url): url is string => !!url);
 }
 
+/** ⚠️ "리뷰를 작성하면 사진이랑 같이 저장은 되는데, 리뷰를 보면 사진이 안 보인다"는
+ * 문제의 진짜 원인: POST /api/stores/{store}/reviews(리뷰 등록) 응답에는 방금 올린
+ * 사진이 images로 함께 실려 오지만, GET /api/stores/{store}/reviews(리뷰 목록 조회)
+ * 응답은 같은 리뷰라도 images를 비워서(또는 아예 안 실어서) 내려줘요. 그래서 등록
+ * 직후엔 사진이 보이다가, 목록을 다시 불러오는 순간(새로고침, 다른 화면에서 다시
+ * 들어오기, 폴링 등) 사진이 사라져요.
+ *
+ * 이 함수는 "리뷰 id별 사진 URL"을 이 기기(localStorage)에 별도로 캐싱해서, 서버가
+ * 어느 한 번이라도(등록 시점, 또는 목록에 실어준 어느 순간) 이 리뷰의 실제 사진을
+ * 보내준 적이 있다면, 그 뒤로 이 기기에서 그 리뷰를 볼 때는(목록 응답이 비어 있어도)
+ * 계속 사진이 보이게 해줘요. 카페 상세의 리뷰 탭, 사장님 리뷰 관리 화면, 내 리뷰 관리
+ * 화면 모두 이 함수 하나로 통일해서 써요. */
+const REVIEW_IMAGE_CACHE_KEY = "cafeon_review_image_cache";
+
+function readReviewImageCache(): Record<string, string[]> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(REVIEW_IMAGE_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeReviewImageCache(cache: Record<string, string[]>) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(REVIEW_IMAGE_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // 시크릿 모드 등 localStorage를 못 쓰는 환경이면 조용히 무시해요.
+  }
+}
+
+/** 이미 URL 문자열 배열로 확실히 알고 있는 사진(예: 방금 리뷰 수정 화면에서 사용자가
+ * 직접 고른 사진)을 리뷰 id에 캐싱해요. PUT 응답 모양을 믿을 수 없을 때, 화면이 이미
+ * 알고 있는 값으로 곧바로 캐시를 채우는 용도예요. */
+export function cacheReviewImages(reviewId: number | string, urls: string[]) {
+  if (urls.length === 0) return;
+  const key = String(reviewId);
+  const cache = readReviewImageCache();
+  if (JSON.stringify(cache[key]) !== JSON.stringify(urls)) {
+    writeReviewImageCache({ ...cache, [key]: urls });
+  }
+}
+
+export function resolveReviewImages(
+  reviewId: number | string,
+  images: ApiReview["images"],
+): string[] {
+  const fromServer = extractReviewImageUrls(images);
+  const key = String(reviewId);
+  if (fromServer.length > 0) {
+    // 서버가 이번엔 사진을 실어줬으면, 다음에 비어 있는 응답이 와도 대비할 수 있게
+    // 이 기기에 저장해둬요.
+    cacheReviewImages(reviewId, fromServer);
+    return fromServer;
+  }
+  const cache = readReviewImageCache();
+  return cache[key] ?? [];
+}
+
 /** 리뷰 작성자 표시 이름을 최대한 넓게 찾아봐요. 스웨거에 이 응답의 정확한
  * 스키마가 없어서(200만 명시), 실제 필드명이 customer_name이 아닐 수 있어요.
  * 흔히 쓰이는 후보 필드명과, user/author/customer/reviewer처럼 중첩된 객체

@@ -42,7 +42,7 @@ import {
   type ApiReview,
   extractReplyContent,
   extractReplyId,
-  extractReviewImageUrls,
+  resolveReviewImages,
   reviewerDisplayName,
 } from "@/lib/api";
 import { useOwnerAuth } from "@/lib/owner-auth-store";
@@ -403,8 +403,12 @@ function mapApiReviewToOwnerReview(review: ApiReview): OwnerReview {
     replyId: extractReplyId(review),
     // ⚠️ review.images는 문자열 배열이 아니라 {id, review_id, image_url,
     // alt_text, sort_order} 객체 배열로 내려와요. 그대로 넣으면 사진이 안
-    // 뜨고 타입도 어긋나서, extractReviewImageUrls로 실제 URL만 꺼내요.
-    images: extractReviewImageUrls(review.images),
+    // 뜨고 타입도 어긋나서, 실제 URL만 꺼내요. 게다가 이 목록 조회 응답은
+    // (등록 응답과 달리) images를 비워서 내려주는 경우가 있어서, 그럴 땐
+    // resolveReviewImages가 이 기기에 저장해둔 같은 리뷰의 사진 캐시로
+    // 대신 채워줘요("리뷰 사진이 등록 직후엔 보이다가 목록에선 사라진다"는
+    // 문제 대응).
+    images: resolveReviewImages(review.id, review.images),
   };
 }
 

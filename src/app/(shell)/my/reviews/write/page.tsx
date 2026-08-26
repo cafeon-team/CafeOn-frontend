@@ -91,15 +91,35 @@ function ReviewWriteContent() {
     try {
       // 아직 업로드 안 한(=새로 고른) 사진들만 실제로 서버에 업로드해요. 이미
       // url이 있는 사진(수정 화면에서 불러온 기존 사진)은 다시 업로드하지 않아요.
-      const uploaded = await Promise.all(
+      //
+      // ⚠️ "사진을 첨부해서 저장해도 사진이 결국 안 보인다"는 문제의 진짜 원인:
+      // apiUploadImage()는 업로드가 실패해도(네트워크 오류, 401/422 등, 응답
+      // 형식이 예상과 다름) 예외를 던지지 않고 조용히 null만 돌려줘요(콘솔에만
+      // "[apiUploadImage]"로 시작하는 로그를 남겨요). 그래서 예전엔 여기서
+      // 실패한 사진을 그냥 목록에서 빼버리고, 나머지(또는 사진 0장)로 리뷰
+      // 저장을 그대로 진행해서 "리뷰가 등록/수정되었습니다" 성공 토스트까지
+      // 떠버렸어요 — 사용자 입장에선 분명 사진을 넣고 저장했는데 사진만
+      // 소리소문없이 사라진 것처럼 보였던 거예요. 이제는 새로 고른 사진 중
+      // 하나라도 업로드에 실패하면 저장 자체를 중단하고 화면에 실패를
+      // 알려서, "성공한 척" 하지 않도록 했어요.
+      const results = await Promise.all(
         photos.map(async (p) => {
-          if (p.url) return p.url;
-          if (!p.file) return null;
+          if (p.url) return { key: p.key, url: p.url, hadFile: false };
+          if (!p.file) return { key: p.key, url: null as string | null, hadFile: false };
           const url = await apiUploadImage(p.file, "customer");
-          return url;
+          return { key: p.key, url, hadFile: true };
         })
       );
-      const images = uploaded.filter((u): u is string => Boolean(u));
+      const failedUpload = results.some((r) => r.hadFile && !r.url);
+      if (failedUpload) {
+        setError(
+          "사진 업로드에 실패해서 저장을 중단했어요. 개발자도구 콘솔(F12)에서 [apiUploadImage] 로그를 확인해주세요. 사진을 빼고 저장하시려면 실패한 사진을 삭제한 뒤 다시 시도해주세요.",
+        );
+        return;
+      }
+      const images = results
+        .map((r) => r.url)
+        .filter((u): u is string => Boolean(u));
 
       if (existingReview) {
         updateReview(existingReview.id, { rating, content, images });

@@ -27,7 +27,7 @@ import {
   isApiConfigured,
   resolveImageUrl,
   extractReplyContent,
-  extractReviewImageUrls,
+  resolveReviewImages,
   reviewerDisplayName,
   type ApiMenu,
   type ApiReview,
@@ -137,14 +137,14 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
         // 나서, 반드시 extractReplyContent로 답글 본문 문자열만 꺼내요.
         reply: extractReplyContent(r.reply),
         // ⚠️ r.images는 문자열 배열이 아니라 {id, review_id, image_url,
-        // alt_text, sort_order} 객체 배열로 내려와요. extractReviewImageUrls로
-        // 실제 사진 URL 문자열만 꺼내요. 서버가 아직 이 리뷰의 사진을 못
-        // 내려주는 경우(구버전 응답 등)엔 이 기기에 남아있는 내 리뷰의 로컬
-        // 업로드 사진으로 대신 보여줘요.
+        // alt_text, sort_order} 객체 배열로 내려와요. 게다가 리뷰 "목록" 응답은
+        // (등록 응답과 달리) 이 필드를 비워서 내려주는 경우가 있어서, 그럴 땐
+        // 이 기기에 남아있는 내 리뷰의 로컬 업로드 사진 → 이 기기의 리뷰별
+        // 사진 캐시(resolveReviewImages) 순서로 대신 보여줘요.
         images:
           localMatch?.images && localMatch.images.length > 0
             ? localMatch.images
-            : extractReviewImageUrls(r.images),
+            : resolveReviewImages(r.id, r.images),
         reviewerName: reviewerDisplayName(r),
       };
     });

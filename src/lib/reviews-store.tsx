@@ -14,7 +14,8 @@ import {
   apiUpdateReview,
   apiDeleteReview,
   apiGetMyReviews,
-  extractReviewImageUrls,
+  resolveReviewImages,
+  cacheReviewImages,
   isApiConfigured,
   type MyApiReview,
 } from "@/lib/api";
@@ -99,7 +100,11 @@ function fromApiReview(r: MyApiReview): Review {
     rating: r.rating,
     content: r.content,
     date,
-    images: extractReviewImageUrls(r.images),
+    // ⚠️ 서버 목록 응답이 images를 비워서 내려주는 경우, resolveReviewImages가
+    // 이 기기에 저장해둔 같은 리뷰의 사진 캐시로 대신 채워줘요. 아래 useEffect의
+    // "prev 캐시 유지" 로직과 같은 문제를 해결하는 공용 함수라, 두 곳 다 결과가
+    // 어긋나지 않아요.
+    images: resolveReviewImages(r.id, r.images),
     // ⚠️ 서버 리뷰 목록 응답엔 이 리뷰가 어느 주문을 인증으로 썼는지가 안 내려와서
     // orderId는 비워둬요. "이미 리뷰를 남긴 주문인지" 판단은 지금 세션에서 직접
     // 작성한 리뷰(orderId 있음)에 한해서만 동작해요.
@@ -134,6 +139,16 @@ export function ReviewsProvider({ children }: { children: ReactNode }) {
   // localhost/IP 등 접속 주소나 기기가 달라도(=localStorage가 비어 있어도)
   // 같은 계정이면 항상 같은 리뷰가 보여요. 아직 서버에 안 올라간(방금 작성해서
   // 서버 응답을 기다리는 중인) 로컬 임시 항목은 그대로 앞에 남겨둬요.
+  //
+  // ⚠️ "리뷰 작성 직후엔 사진이 잘 보이는데, 새로고침(또는 npm run dev 재시작
+  // 후 새로 접속)하면 사진이 사라진다"는 문제의 원인: GET /api/stores/{store}/reviews
+  // (매장 단위 리뷰 목록) 응답이 images를 포함해주지 않는 것으로 보여요(생성
+  // 시점엔 POST 응답에 담겨서 화면에 바로 보였지만, 목록 조회에선 안 실려요).
+  // 그래서 이 useEffect가 "서버가 최신"이라고 믿고 매번 통째로 덮어쓰면서,
+  // 서버가 안 준 images를 그대로 빈 배열로 밀어 넣어 사진이 지워졌던 거예요.
+  // 생년월일과 같은 이유로, 서버 응답에 images가 없을 때는 이 기기에 이미
+  // 저장해둔(=이전에 실제로 업로드까지 성공한) 같은 리뷰의 사진을 그대로
+  // 유지하도록 고쳤어요. 서버가 images를 실제로 내려주면 그 값이 우선해요.
   useEffect(() => {
     if (!isApiConfigured()) return;
     let cancelled = false;
@@ -142,7 +157,16 @@ export function ReviewsProvider({ children }: { children: ReactNode }) {
       const mapped = serverReviews.map(fromApiReview);
       setReviews((prev) => {
         const localOnly = prev.filter((r) => !isServerReviewId(r.id));
-        return persist([...localOnly, ...mapped]);
+        const prevById = new Map(prev.map((r) => [r.id, r] as const));
+        const merged = mapped.map((sr) => {
+          if (sr.images && sr.images.length > 0) return sr;
+          const cached = prevById.get(sr.id);
+          if (cached?.images && cached.images.length > 0) {
+            return { ...sr, images: cached.images };
+          }
+          return sr;
+        });
+        return persist([...localOnly, ...merged]);
       });
     });
     return () => {
@@ -180,6 +204,10 @@ export function ReviewsProvider({ children }: { children: ReactNode }) {
           images: images && images.length > 0 ? images : undefined,
         }).then((created) => {
           if (!created) return;
+          // 서버가 등록 응답에 실어준 사진을 이 리뷰 id로 즉시 캐싱해둬요. 나중에
+          // 목록 조회(GET) 응답이 images를 비워서 내려주더라도, resolveReviewImages가
+          // 이 캐시를 대신 써서 사진이 계속 보이게 해요.
+          resolveReviewImages(created.id, created.images);
           // 서버가 실제로 발급해준 id로 바꿔서, 이후 수정·삭제가 서버에도 반영되게 해요.
           setReviews((prev) =>
             persist(prev.map((r) => (r.id === localId ? { ...r, id: String(created.id) } : r)))
@@ -188,6 +216,12 @@ export function ReviewsProvider({ children }: { children: ReactNode }) {
       },
       updateReview: (id, patch) => {
         setReviews((prev) => persist(prev.map((r) => (r.id === id ? { ...r, ...patch } : r))));
+        // 방금 화면에서 직접 고른 사진이라 정확한 값이에요. PUT 응답이 이 사진을
+        // 다시 실어주는지와 상관없이, 이 리뷰 id의 사진 캐시를 바로 맞는 값으로
+        // 채워둬서 목록 조회에서 사진이 비어 보이는 문제를 막아요.
+        if (patch.images && patch.images.length > 0) {
+          cacheReviewImages(id, patch.images);
+        }
         if (isApiConfigured() && isServerReviewId(id)) {
           // images도 함께 보내요(서버가 이 필드를 지원하면 다른 기기·다른 손님도
           // 수정된 사진을 볼 수 있어요. 지원하지 않으면 서버가 조용히 무시해요).
