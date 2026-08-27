@@ -7,7 +7,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Heart,
   Navigation,
   Share2,
   Star,
@@ -16,6 +15,7 @@ import {
 import ImagePlaceholder from "@/components/ImagePlaceholder";
 import StatusBadge from "@/components/StatusBadge";
 import AmenityIcon from "@/components/AmenityIcon";
+import FavoriteButton from "@/components/FavoriteButton";
 import StarRating from "@/components/StarRating";
 import { useReviews } from "@/lib/reviews-store";
 import { useWishlist } from "@/lib/wishlist-store";
@@ -27,7 +27,7 @@ import {
   isApiConfigured,
   resolveImageUrl,
   extractReplyContent,
-  resolveReviewImages,
+  extractReviewImageUrls,
   reviewerDisplayName,
   type ApiMenu,
   type ApiReview,
@@ -137,14 +137,14 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
         // 나서, 반드시 extractReplyContent로 답글 본문 문자열만 꺼내요.
         reply: extractReplyContent(r.reply),
         // ⚠️ r.images는 문자열 배열이 아니라 {id, review_id, image_url,
-        // alt_text, sort_order} 객체 배열로 내려와요. 게다가 리뷰 "목록" 응답은
-        // (등록 응답과 달리) 이 필드를 비워서 내려주는 경우가 있어서, 그럴 땐
-        // 이 기기에 남아있는 내 리뷰의 로컬 업로드 사진 → 이 기기의 리뷰별
-        // 사진 캐시(resolveReviewImages) 순서로 대신 보여줘요.
+        // alt_text, sort_order} 객체 배열로 내려와요. extractReviewImageUrls로
+        // 실제 사진 URL 문자열만 꺼내요. 서버가 아직 이 리뷰의 사진을 못
+        // 내려주는 경우(구버전 응답 등)엔 이 기기에 남아있는 내 리뷰의 로컬
+        // 업로드 사진으로 대신 보여줘요.
         images:
           localMatch?.images && localMatch.images.length > 0
             ? localMatch.images
-            : resolveReviewImages(r.id, r.images),
+            : extractReviewImageUrls(r.images),
         reviewerName: reviewerDisplayName(r),
       };
     });
@@ -273,9 +273,16 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
     // resolveImageUrl이 API 서버 절대주소로 바꿔줘요(없으면 회색 플레이스홀더로
     // 자동 폴백).
     imageUrl: resolveImageUrl(m.image_url),
+    // ⚠️ 사장님이 메뉴 재고를 0으로 설정하면 서버가 is_available: false로
+    // 내려줘요("재고 관련 필드가 메뉴 API엔 없다"는 걸 확인한 뒤, 실제로
+    // 존재·저장되는 이 필드로 품절을 표현해요). 손님 화면에서도 품절인 메뉴는
+    // "재고 없음"으로 보여주고 담기 버튼을 막아요.
+    soldOut: m.is_available === false,
   }));
 
-  const handleAddToCart = (m: { id: string; name: string; price: number }) => {
+  const handleAddToCart = (m: { id: string; name: string; price: number; soldOut?: boolean }) => {
+    // 품절 메뉴는 버튼도 비활성화돼 있지만, 혹시 모를 경우를 대비해 한 번 더 막아요.
+    if (m.soldOut) return;
     // ⚠️ 예전엔 비로그인 상태로 "담기"를 누르면 곧장 /login(로그인 입력 폼)으로
     // 보냈는데, "예약하기"를 누를 때는 다른 화면이 떠요 — /reserve/new는
     // isPublicPath에 없어서 AuthGate가 가로채 "로그인이 필요해요" 안내 화면을
@@ -331,17 +338,12 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
         </button>
 
         <div className="absolute right-4 top-4 flex items-center gap-2">
-          <button
-            aria-label="찜하기"
-            onClick={() => toggleLike(cafe.id)}
-            className="flex h-9 w-9 items-center justify-center rounded-full bg-white/90"
-          >
-            <Heart
-              size={18}
-              className={liked ? "fill-brand text-brand" : "text-ink"}
-              strokeWidth={1.8}
-            />
-          </button>
+          <FavoriteButton
+            liked={liked}
+            onToggle={() => toggleLike(cafe.id)}
+            iconSize={18}
+            className="h-9 w-9 rounded-full bg-white/90"
+          />
           {/* ⚠️ 예전엔 여기가 점 세개(더보기) 버튼이었고, 눌러야 나오는 메뉴
               안에 "공유하기" 하나만 들어있었어요. 항목이 하나뿐이라 한 번 더
               누르게 만들 이유가 없어서, 바로 공유하기 아이콘 버튼으로 바꿨어요. */}
@@ -469,7 +471,10 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
           ) : (
           <div className="flex flex-col gap-4">
             {menuItems.map((m) => (
-              <div key={m.id} className="flex items-center gap-4">
+              <div
+                key={m.id}
+                className={"flex items-center gap-4" + (m.soldOut ? " opacity-50" : "")}
+              >
                 <ImagePlaceholder
                   className="h-14 w-14 shrink-0"
                   rounded="rounded-full"
@@ -482,12 +487,23 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
                   <p className="mt-0.5 text-[14px] font-bold text-ink">
                     {m.price.toLocaleString()}원
                   </p>
+                  {m.soldOut && (
+                    <p className="mt-0.5 text-[12.5px] font-bold text-danger">
+                      재고 없음
+                    </p>
+                  )}
                 </div>
                 <button
                   onClick={() => handleAddToCart(m)}
-                  className="flex h-9 items-center rounded-full border border-brand px-4 text-[13px] font-bold text-brand"
+                  disabled={m.soldOut}
+                  className={
+                    "flex h-9 items-center rounded-full border px-4 text-[13px] font-bold " +
+                    (m.soldOut
+                      ? "border-border text-ink-muted"
+                      : "border-brand text-brand")
+                  }
                 >
-                  담기
+                  {m.soldOut ? "품절" : "담기"}
                 </button>
               </div>
             ))}

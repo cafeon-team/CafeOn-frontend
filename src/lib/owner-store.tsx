@@ -16,8 +16,10 @@ import {
   apiOwnerCreateMenuCategory,
   apiOwnerUpdateMenu,
   apiOwnerDeleteMenu,
+  apiOwnerSetMenuAvailability,
   apiOwnerListStoreOrders,
   apiOwnerUpdateOrderStatus,
+  apiOwnerCancelOrder,
   type ApiOrderDetail,
   apiOwnerReplyToReview,
   apiOwnerUpdateReviewReply,
@@ -34,6 +36,7 @@ import {
   apiOwnerUpdateBusinessStatus,
   apiOwnerUpdateStoreProfile,
   apiGetStoreCongestion,
+  apiGetMe,
   isApiConfigured,
   type ApiStore,
   type ApiStoreTag,
@@ -42,7 +45,7 @@ import {
   type ApiReview,
   extractReplyContent,
   extractReplyId,
-  resolveReviewImages,
+  extractReviewImageUrls,
   reviewerDisplayName,
 } from "@/lib/api";
 import { useOwnerAuth } from "@/lib/owner-auth-store";
@@ -151,9 +154,12 @@ export type SettingsState = {
 export type OwnerInquiry = {
   id: string;
   content: string;
+  email: string;
   createdAt: string;
   status: "접수됨" | "답변 완료";
 };
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export type SalesPoint = {
   hour: string; // "09" ~ "21"
@@ -403,12 +409,8 @@ function mapApiReviewToOwnerReview(review: ApiReview): OwnerReview {
     replyId: extractReplyId(review),
     // ⚠️ review.images는 문자열 배열이 아니라 {id, review_id, image_url,
     // alt_text, sort_order} 객체 배열로 내려와요. 그대로 넣으면 사진이 안
-    // 뜨고 타입도 어긋나서, 실제 URL만 꺼내요. 게다가 이 목록 조회 응답은
-    // (등록 응답과 달리) images를 비워서 내려주는 경우가 있어서, 그럴 땐
-    // resolveReviewImages가 이 기기에 저장해둔 같은 리뷰의 사진 캐시로
-    // 대신 채워줘요("리뷰 사진이 등록 직후엔 보이다가 목록에선 사라진다"는
-    // 문제 대응).
-    images: resolveReviewImages(review.id, review.images),
+    // 뜨고 타입도 어긋나서, extractReviewImageUrls로 실제 URL만 꺼내요.
+    images: extractReviewImageUrls(review.images),
   };
 }
 
@@ -530,7 +532,16 @@ type OwnerContextValue = {
    * 없어서) 화면에 붙였던 항목을 다시 지우고 실패를 알려줘요 — 저장 안 된
    * 메뉴가 화면에만 남아있다가 재로그인 시 사라지는 것처럼 보이지 않게 해요. */
   addMenuItem: (item: Omit<OwnerMenuItem, "id">) => Promise<{ ok: boolean; error?: string }>;
-  updateMenuItem: (id: string, patch: Partial<OwnerMenuItem>) => void;
+  /** 메뉴를 수정해요. 서버 저장(PUT /api/owner/menus/{menu})이 실패하면 화면에
+   * 미리 반영했던 내용을 원래 값으로 되돌리고 실패를 알려줘요 — 예전엔 이 호출
+   * 결과를 아예 확인하지 않아서("void apiOwnerUpdateMenu(...)"), 서버 저장이
+   * 실패해도 화면은 마치 성공한 것처럼 잠깐 바뀌었다가, 8초마다 자동으로 서버
+   * 목록을 다시 불러올 때 원래(수정 전) 값으로 조용히 되돌아갔어요. 사용자
+   * 입장에선 "수정 완료를 눌렀는데 반영이 안 된다"로 보였던 원인이에요. */
+  updateMenuItem: (
+    id: string,
+    patch: Partial<OwnerMenuItem>,
+  ) => Promise<{ ok: boolean; error?: string }>;
   removeMenuItem: (id: string) => void;
 
   reviews: OwnerReview[];
@@ -546,7 +557,14 @@ type OwnerContextValue = {
   setSettings: (patch: Partial<SettingsState>) => void;
 
   inquiries: OwnerInquiry[];
-  addInquiry: (content: string) => void;
+  /** 문의를 등록해요. 화면(문의 내역)에는 즉시 반영되고, 동시에 실제 관리자
+   * 메일로도 전송을 시도해요(/api/owner/inquiry). 메일 전송이 실패해도 화면의
+   * 문의 내역 자체는 그대로 남지만, 호출한 쪽(support/page.tsx)이 실패 사유를
+   * 안내할 수 있도록 결과를 돌려줘요. */
+  addInquiry: (
+    content: string,
+    email: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
 
   todaySalesByHour: SalesPoint[];
   addSalesPoint: (point: SalesPoint) => void;
@@ -741,18 +759,46 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
           return;
         }
         setMenusLoadFailed(false);
-        setMenu(
-          rows.map((m) => ({
-            id: String(m.id),
-            name: m.name,
-            price: Math.round(Number(m.price)),
-            category: m.category
-              ? normalizeMenuCategory(m.category)
-              : guessMenuCategory(m.name),
-            stock: null,
-            imageUrl: m.image_url ?? null,
-          }))
-        );
+        // ⚠️ 재고(stock)는 서버 응답에 없을 수 있어요. 그런데 이 목록은 8초마다
+        // 자동으로 다시 불러오기 때문에, 여기서 매번 stock을 null로 덮어써버리면
+        // 방금 저장한 재고 숫자가 몇 초 뒤 다시 "무제한"으로 보이는 문제가
+        // 생겨요. 서버가 stock을 내려주면 그 값을 쓰고, 안 내려주면 화면에
+        // 이미 반영돼 있던 값을 그대로 유지해요.
+        setMenu((prev) => {
+          const prevById = new Map(prev.map((m) => [m.id, m]));
+          return rows.map((m) => {
+            const id = String(m.id);
+            const prevItem = prevById.get(id);
+            // ⚠️ Swagger로 다시 확인해보니 메뉴 등록/수정 API에는 "재고 수량"
+            // 필드가 아예 없어요(재고는 원재료 재고를 다루는 완전히 별도의
+            // "Owner Inventory" API예요). 메뉴 API가 실제로 지원·저장하는 값은
+            // "지금 팔 수 있는지"(is_available)뿐이라서, 그것만 서버 값을
+            // 우선해요: 서버가 명확히 품절(is_available === false)이라고 하면
+            // 최우선으로 반영하고(재로그인해도 "재고 없음"이 유지되는 이유),
+            // 품절이 아니면 화면에 이미 보이던 참고용 재고 숫자를 최대한 유지해요.
+            // 단, 직전엔 품절(0)이었는데 서버가 이제 판매 가능이라고 하면(다른
+            // 기기 등에서 품절을 풀었을 수 있어요) 0을 그대로 두지 않고
+            // "무제한"으로 바꿔요 — 0인데 주문이 되는 모순을 막기 위해서예요.
+            let stock: number | null;
+            if (m.is_available === false) {
+              stock = 0;
+            } else if (prevItem && prevItem.stock !== 0) {
+              stock = prevItem.stock;
+            } else {
+              stock = null;
+            }
+            return {
+              id,
+              name: m.name,
+              price: Math.round(Number(m.price)),
+              category: m.category
+                ? normalizeMenuCategory(m.category)
+                : guessMenuCategory(m.name),
+              stock,
+              imageUrl: m.image_url ?? null,
+            };
+          });
+        });
       });
     };
     load(true);
@@ -1443,13 +1489,53 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
   };
 
   const acceptOrder = (id: string) => void updateOrderStatus(id, "준비중", "CONFIRMED");
-  const rejectOrder = (id: string) => void updateOrderStatus(id, "취소됨", "REJECTED");
   const markOrderReady = (id: string) => void updateOrderStatus(id, "준비완료", "READY");
   const completeOrder = (id: string) => void updateOrderStatus(id, "완료", "COMPLETED");
-  // ⚠️ "결제대기 주문 취소" 화면이 성공 여부를 보고 나서만 이전 화면으로
-  // 돌아갈 수 있도록, 다른 액션들과 달리 void로 던지지 않고 결과를 그대로
-  // 돌려줘요.
-  const cancelOrder = (id: string) => updateOrderStatus(id, "취소됨", "CANCELLED");
+  // ⚠️ 예전엔 이것도 updateOrderStatus(..., "CANCELLED")로 PATCH .../status를
+  // 호출했는데, 서버가 취소는 status enum이 아니라 전용 엔드포인트로 받아서
+  // 매번 "The selected status is invalid."로 거절됐어요(위 apiOwnerCancelOrder
+  // 주석 참고). 낙관적 업데이트/실패 시 되돌리기는 updateOrderStatus와 동일한
+  // 방식으로 여기서 직접 처리해요.
+  const cancelOrder = async (id: string): Promise<{ ok: boolean; message?: string }> => {
+    let prevStatus: OrderState | undefined;
+    ordersRequestIdRef.current++;
+    setOrders((prev) =>
+      prev.map((o) => {
+        if (o.id !== id) return o;
+        prevStatus = o.status;
+        return { ...o, status: "취소됨" };
+      }),
+    );
+    if (!isOwnerLoggedIn) return { ok: true };
+    const result = await apiOwnerCancelOrder(id);
+    ordersRequestIdRef.current++;
+    if (!result.ok) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[cancelOrder] 주문 #${id} 취소를 서버에 저장하지 못했어요(${result.message ?? "사유 불명"}). 화면을 원래 상태로 되돌려요.`,
+      );
+      if (prevStatus) {
+        setOrders((prev) => prev.map((o) => (o.id === id ? { ...o, status: prevStatus! } : o)));
+      }
+      return {
+        ok: false,
+        message: result.message ?? "서버에 저장하지 못했어요. 잠시 후 다시 시도해주세요.",
+      };
+    }
+    return { ok: true };
+  };
+
+  // ⚠️ "거절을 눌러도 카드가 사라졌다가 그대로 다시 뜨는" 문제의 원인: 예전엔
+  // rejectOrder도 updateOrderStatus(id, "취소됨", "REJECTED")로 PATCH .../status에
+  // CANCELLED/REJECTED/DECLINED 후보를 보냈는데, 바로 위 cancelOrder와 똑같은
+  // 이유로 서버가 이 엔드포인트에서는 "취소" 계열 상태값을 전부 422("The
+  // selected status is invalid.")로 거절해요. 그래서 화면은 낙관적으로 먼저
+  // "취소됨"으로 바뀌어 접수 대기 목록에서 잠깐 사라졌다가, 서버 응답이 실패로
+  // 오면 원래 상태("주문접수")로 되돌려져서 다시 나타났던 거예요. "거절"은
+  // 아직 준비를 시작하지 않은 주문을 취소하는 것과 서버 입장에서 같은 동작이라,
+  // 실제로 성공하는 전용 취소 엔드포인트(POST .../orders/{id}/cancel)를 쓰는
+  // cancelOrder를 그대로 재사용해요.
+  const rejectOrder = (id: string) => void cancelOrder(id);
 
   const addMenuItem = async (
     item: Omit<OwnerMenuItem, "id">
@@ -1461,12 +1547,24 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     // ownerStoreId가 없으면 여기서 그냥 return 해버려서 서버 저장 자체를
     // 건너뛰었어요(=화면엔 보이지만 실제로는 저장 안 된 상태). isApiConfigured
     // 체크는 apiOwnerCreateMenu 내부에서 이미 하기 때문에 여기선 바로 호출해요.
+    // ⚠️ Swagger로 확인한 결과 메뉴 등록/수정 API에는 "재고 수량" 필드가 전혀
+    // 없어요 — 재고는 원재료 재고를 다루는 완전히 별도의 "Owner Inventory"
+    // 리소스(POST/GET /api/owner/stores/{store}/inventory 등)이고, 메뉴 하나당
+    // 판매 가능 수량이라는 개념 자체가 이 서버엔 없어요. 예전엔 여기서 stock을
+    // 그대로 메뉴 저장 요청에 실어 보냈는데, 서버가 조용히 무시하는 자리라
+    // 계속 사라졌고, 그게 "로그아웃하면 재고가 다시 무제한으로 보인다"는
+    // 문제의 진짜 원인이었어요. 메뉴 API가 실제로 지원·저장하는 값은 "지금
+    // 팔 수 있는지"(is_available)뿐이라, 재고를 0으로 두면 품절(is_available:
+    // false)로, 그 외(빈칸=무제한, 1 이상 숫자)엔 판매 가능(true)으로 매핑해요.
+    // 숫자 재고 자체(예: "5개")는 서버에 저장할 자리가 없어서 이 화면에서만
+    // 참고용으로 보여줘요.
+    const isAvailable = item.stock !== 0;
     const payload = {
       name: item.name,
       price: item.price,
       category: item.category,
       image_url: item.imageUrl,
-      is_available: true,
+      is_available: isAvailable,
     };
 
     let created = await apiOwnerCreateMenu(payload);
@@ -1490,6 +1588,12 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
       };
     }
 
+    // ⚠️ 생성 요청 바디에 실은 is_available이 실제로 반영되는지는 문서상
+    // 100% 확정돼 있지 않고(품절 전용 PATCH 엔드포인트가 따로 문서화돼
+    // 있어요), 방금 겪은 "조용히 무시되는 필드" 문제를 반복하지 않기 위해
+    // 전용 엔드포인트로 한 번 더 확실하게 반영해요.
+    void apiOwnerSetMenuAvailability(created.id, isAvailable);
+
     // 서버가 발급한 진짜 id로 교체해요. (이후 수정/삭제가 서버에도 반영되도록)
     setMenu((prev) =>
       prev.map((m) => (m.id === tempId ? { ...m, id: String(created!.id) } : m))
@@ -1497,16 +1601,50 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
     return { ok: true };
   };
 
-  const updateMenuItem = (id: string, patch: Partial<OwnerMenuItem>) => {
+  const updateMenuItem = async (
+    id: string,
+    patch: Partial<OwnerMenuItem>,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    // 되돌려야 할 수도 있으니 수정 전 값을 먼저 기억해둬요.
+    const previous = menu.find((m) => m.id === id) ?? null;
+
+    // 화면엔 먼저 반영해서(낙관적 업데이트) 버튼을 누르자마자 바뀐 걸
+    // 보여줘요. 서버 저장이 실패하면 아래에서 이 값을 다시 되돌려요.
     setMenu((prev) =>
       prev.map((m) => (m.id === id ? { ...m, ...patch } : m))
     );
-    void apiOwnerUpdateMenu(id, {
+
+    const updated = await apiOwnerUpdateMenu(id, {
       name: patch.name,
       price: patch.price,
       category: patch.category,
       image_url: patch.imageUrl,
+      // ⚠️ stock은 여기로 보내지 않아요 — 메뉴 API엔 그런 필드가 없어서 서버가
+      // 조용히 무시했고, 그게 로그아웃 후 재고가 "무제한"으로 되돌아가는
+      // 것처럼 보이던 진짜 원인이었어요(실제로는 애초에 저장된 적이 없었어요).
     });
+
+    if (!updated) {
+      // 서버 저장이 실패했으면 화면도 수정 전 값으로 되돌려서, "잠깐 바뀐
+      // 것처럼 보이다가 8초 뒤 자동 새로고침 때 조용히 원래대로 돌아가는"
+      // 일이 없게 해요. 대신 여기서 바로 실패를 알려줘요.
+      if (previous) {
+        setMenu((prev) => prev.map((m) => (m.id === id ? previous : m)));
+      }
+      return {
+        ok: false,
+        error: "메뉴 수정을 서버에 저장하지 못했어요. 잠시 후 다시 시도해주세요.",
+      };
+    }
+
+    if (patch.stock !== undefined) {
+      // 재고를 0으로 두면 품절, 그 외(무제한/숫자)엔 판매 가능으로 취급해서
+      // 실제로 존재하고 서버에 저장되는 "품절 여부"(is_available) 전용
+      // 엔드포인트에 반영해요. 이게 이제 로그아웃해도 유지돼요.
+      void apiOwnerSetMenuAvailability(id, patch.stock !== 0);
+    }
+
+    return { ok: true };
   };
 
   const removeMenuItem = (id: string) => {
@@ -1548,20 +1686,85 @@ export function OwnerProvider({ children }: { children: ReactNode }) {
   const setSettings = (patch: Partial<SettingsState>) =>
     setSettingsState((prev) => ({ ...prev, ...patch }));
 
-  const addInquiry = (content: string) =>
-    setInquiries((prev) => [
-      {
-        id: `inq-${Date.now()}`,
-        content,
-        createdAt: new Date().toLocaleDateString("ko-KR", {
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
+  const addInquiry = async (
+    content: string,
+    email: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return { ok: false, error: "문의 내용을 입력해주세요." };
+    }
+
+    // 답변을 받을 이메일은 사장님이 화면(support/page.tsx)에서 직접 입력/수정한
+    // 값을 그대로 써요. 로그인 계정 이메일과 다른 주소로 답변받고 싶을 수도
+    // 있어서, 자동으로 불러온 값으로 덮어쓰지 않아요.
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail || !EMAIL_RE.test(trimmedEmail)) {
+      return {
+        ok: false,
+        error: "답변 받으실 이메일 주소를 올바르게 입력해주세요.",
+      };
+    }
+
+    // 화면(문의 내역)엔 먼저 반영해서, 메일 전송 결과와 상관없이 사장님이
+    // 방금 작성한 문의를 바로 확인할 수 있게 해요.
+    const newInquiry: OwnerInquiry = {
+      id: `inq-${Date.now()}`,
+      content: trimmed,
+      email: trimmedEmail,
+      createdAt: new Date().toLocaleDateString("ko-KR", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }),
+      status: "접수됨",
+    };
+    setInquiries((prev) => [newInquiry, ...prev]);
+
+    // 사장님 이름은 로그인 정보에서 참고용으로만 가져와요(관리자가 메일만
+    // 보고도 누구인지 알아볼 수 있게). 백엔드에 문의 전용 저장 API가 없어서
+    // (2026-08-19 백엔드 변경사항 문서 기준), 문의 자체는 서버에 저장하지
+    // 않고 곧바로 메일로만 전달해요.
+    let ownerName: string | null = null;
+    if (isOwnerLoggedIn && isApiConfigured()) {
+      const me = await apiGetMe("owner");
+      if (me) {
+        ownerName = me.name;
+      }
+    }
+
+    try {
+      const res = await fetch("/api/owner/inquiry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content: trimmed,
+          storeName: store.name,
+          phone: store.phone,
+          ownerName,
+          ownerEmail: trimmedEmail,
         }),
-        status: "접수됨",
-      },
-      ...prev,
-    ]);
+      });
+      const data = (await res.json().catch(() => null)) as
+        | { ok?: boolean; error?: string }
+        | null;
+      if (!res.ok || !data?.ok) {
+        return {
+          ok: false,
+          error:
+            data?.error ??
+            "문의는 등록됐지만 관리자에게 메일 전송은 실패했어요.",
+        };
+      }
+      return { ok: true };
+    } catch {
+      return {
+        ok: false,
+        error:
+          "문의는 등록됐지만 관리자에게 메일 전송은 실패했어요. 네트워크 연결을 확인해주세요.",
+      };
+    }
+  };
 
   const addSalesPoint = (point: SalesPoint) =>
     setTodaySalesByHour((prev) => [...prev, point]);

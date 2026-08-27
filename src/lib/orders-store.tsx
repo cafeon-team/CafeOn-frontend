@@ -73,7 +73,7 @@ type OrdersContextValue = {
   loading: boolean;
   /** 결제 완료 직후 등 화면에서 주문 목록을 최신 상태로 다시 불러오고 싶을 때 사용해요. */
   refetchOrders: () => void;
-  cancelOrder: (id: string) => Promise<{ ok: boolean; message?: string }>;
+  cancelOrder: (id: string) => Promise<boolean>;
 };
 
 const OrdersContext = createContext<OrdersContextValue | null>(null);
@@ -151,21 +151,14 @@ export function OrdersProvider({ children }: { children: ReactNode }) {
   const refetchOrders = () => setRefreshKey((k) => k + 1);
 
   const cancelOrder = async (id: string) => {
-    const result = await apiCancelMyOrder(id);
-    if (result.ok) {
+    const ok = await apiCancelMyOrder(id);
+    if (ok) {
       requestIdRef.current++; // 그 전에 나가 있던 폴링 응답은 무시하게 만들어요.
       setOrders((prev) =>
         prev.map((o) => (o.id === id ? { ...o, status: "취소됨" } : o))
       );
-      return { ok: true as const };
     }
-    // ⚠️ 예전엔 실패해도 아무 것도 돌려주지 않아서, 버튼을 눌러도 "아무 반응이
-    // 없는 것"처럼 보였어요. 실패 사유를 그대로 위로 올려서 화면에서 안내할 수
-    // 있게 해요.
-    return {
-      ok: false as const,
-      message: result.message ?? "취소에 실패했어요. 잠시 후 다시 시도해주세요.",
-    };
+    return ok;
   };
 
   const value = useMemo<OrdersContextValue>(

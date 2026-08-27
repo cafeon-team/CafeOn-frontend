@@ -27,7 +27,6 @@ export default function OrderDetailPage({
   const { orders, cancelOrder } = useOrders();
   const order = orders.find((o) => o.id === params.id);
   const [cancelling, setCancelling] = useState(false);
-  const [cancelError, setCancelError] = useState<string | null>(null);
   // ⚠️ 리뷰는 이제 카페 상세가 아니라 여기(완료된 주문)에서만 남길 수 있어요.
   // 이미 이 주문으로 리뷰를 남겼으면 "리뷰 남기기" 대신 내가 쓴 리뷰를
   // 보여주고, 아직이면 작성 화면으로 보내요.
@@ -59,13 +58,7 @@ export default function OrderDetailPage({
 
   const handleCancel = async () => {
     setCancelling(true);
-    setCancelError(null);
-    // ⚠️ 예전엔 결과를 아예 안 봐서, 서버가 취소를 거절해도 화면은 그대로라
-    // "취소 버튼이 안 먹힌다"로만 보였어요. 실패하면 이유를 바로 보여줘요.
-    const result = await cancelOrder(order.id);
-    if (!result.ok) {
-      setCancelError(result.message ?? "취소에 실패했어요. 잠시 후 다시 시도해주세요.");
-    }
+    await cancelOrder(order.id);
     setCancelling(false);
   };
 
@@ -120,9 +113,6 @@ export default function OrderDetailPage({
             >
               {cancelling ? "취소하는 중…" : "주문 취소"}
             </button>
-            {cancelError && (
-              <p className="mt-3 text-[13px] text-danger">{cancelError}</p>
-            )}
           </div>
         )}
 

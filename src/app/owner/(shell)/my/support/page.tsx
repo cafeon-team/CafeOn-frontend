@@ -5,6 +5,10 @@ import { ChevronDown, X } from "lucide-react";
 import Header from "@/components/Header";
 import Toast from "@/components/Toast";
 import { useOwner } from "@/lib/owner-store";
+import { useOwnerAuth } from "@/lib/owner-auth-store";
+import { apiGetMe, isApiConfigured } from "@/lib/api";
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const faqs: { q: string; a: string }[] = [
   {
@@ -39,15 +43,57 @@ const faqs: { q: string; a: string }[] = [
 
 export default function OwnerSupportPage() {
   const { inquiries, addInquiry } = useOwner();
+  const { isOwnerLoggedIn } = useOwnerAuth();
   const [openQ, setOpenQ] = useState<string | null>(null);
   const [showInquiryForm, setShowInquiryForm] = useState(false);
   const [showInquiryList, setShowInquiryList] = useState(false);
   const [draft, setDraft] = useState("");
+  const [email, setEmail] = useState("");
   const [inquirySent, setInquirySent] = useState(false);
+  const [inquiryError, setInquiryError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
-  const submitInquiry = () => {
-    if (!draft.trim()) return;
-    addInquiry(draft.trim());
+  const openInquiryForm = () => {
+    setInquiryError(null);
+    setShowInquiryForm(true);
+    // 로그인한 사장님이면 계정 이메일을 기본값으로 채워주되, 답변을 다른
+    // 메일로 받고 싶을 수도 있으니 직접 수정할 수 있게 열어둬요.
+    if (!email && isOwnerLoggedIn && isApiConfigured()) {
+      void apiGetMe("owner").then((me) => {
+        if (me?.email) {
+          setEmail((prev) => prev || me.email);
+        }
+      });
+    }
+  };
+
+  const submitInquiry = async () => {
+    const trimmedContent = draft.trim();
+    const trimmedEmail = email.trim();
+
+    if (!trimmedContent) {
+      setInquiryError("문의 내용을 입력해주세요.");
+      return;
+    }
+    if (!trimmedEmail || !EMAIL_RE.test(trimmedEmail)) {
+      setInquiryError("답변 받으실 이메일 주소를 올바르게 입력해주세요.");
+      return;
+    }
+    if (submitting) return;
+
+    setSubmitting(true);
+    setInquiryError(null);
+    const result = await addInquiry(trimmedContent, trimmedEmail);
+    setSubmitting(false);
+    if (!result.ok) {
+      // 문의 자체는 문의 내역에 등록됐지만(owner-store.tsx의 addInquiry 참고),
+      // 관리자 메일 전송에는 실패했다는 걸 그대로 알려줘요 — 조용히 실패해서
+      // "분명 눌렀는데 관리자한테 안 갔다"처럼 보이지 않게 하기 위해서예요.
+      setInquiryError(
+        result.error ?? "문의 등록에 실패했어요. 잠시 후 다시 시도해주세요."
+      );
+      return;
+    }
     setDraft("");
     setShowInquiryForm(false);
     setInquirySent(true);
@@ -104,7 +150,7 @@ export default function OwnerSupportPage() {
         </p>
 
         <button
-          onClick={() => setShowInquiryForm(true)}
+          onClick={openInquiryForm}
           className="mt-4 flex h-14 w-full items-center justify-center rounded-2xl bg-trust text-[16px] font-bold text-white active:bg-trust-dark"
         >
           1:1 문의하기
@@ -119,7 +165,28 @@ export default function OwnerSupportPage() {
       </div>
 
       {showInquiryForm && (
-        <Sheet onClose={() => setShowInquiryForm(false)} title="1:1 문의하기">
+        <Sheet
+          onClose={() => {
+            setShowInquiryForm(false);
+            setInquiryError(null);
+          }}
+          title="1:1 문의하기"
+        >
+          <label className="mb-1.5 block text-[13px] font-medium text-ink-secondary">
+            답변 받을 이메일
+          </label>
+          <input
+            type="email"
+            inputMode="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="이메일을 입력해주세요."
+            className="w-full rounded-xl border border-border bg-white p-3.5 text-[14.5px] outline-none focus:border-trust"
+          />
+
+          <label className="mb-1.5 mt-4 block text-[13px] font-medium text-ink-secondary">
+            문의 내용
+          </label>
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -127,11 +194,18 @@ export default function OwnerSupportPage() {
             placeholder="문의하실 내용을 입력해주세요."
             className="w-full rounded-xl border border-border bg-white p-3.5 text-[14.5px] outline-none focus:border-trust"
           />
+
+          {inquiryError && (
+            <p className="mt-2 text-[13px] leading-relaxed text-red-500">
+              {inquiryError}
+            </p>
+          )}
           <button
             onClick={submitInquiry}
-            className="mt-3 flex h-12 w-full items-center justify-center rounded-xl bg-trust text-[14.5px] font-bold text-white active:bg-trust-dark"
+            disabled={submitting || !draft.trim() || !email.trim()}
+            className="mt-3 flex h-12 w-full items-center justify-center rounded-xl bg-trust text-[14.5px] font-bold text-white active:bg-trust-dark disabled:opacity-50"
           >
-            문의 등록하기
+            {submitting ? "등록 중..." : "문의 등록하기"}
           </button>
         </Sheet>
       )}
@@ -160,6 +234,7 @@ export default function OwnerSupportPage() {
                   <p className="mt-1.5 text-[14px] text-ink-secondary">
                     {inq.content}
                   </p>
+                  <p className="mt-1 text-[12px] text-ink-muted">{inq.email}</p>
                 </div>
               ))}
             </div>

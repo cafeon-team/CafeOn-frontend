@@ -139,21 +139,15 @@ export function setOwnerStoreId(storeId: number | null) {
 export class ApiError extends Error {
   status: number;
   fieldErrors?: Record<string, string[]>;
-  /** 429(너무 많은 요청) 응답일 때, 몇 초 후에 다시 시도할 수 있는지. 로그인
-   * 화면(app/login, app/owner/login)이 이 값으로 "n초 후 다시 시도해주세요"
-   * 카운트다운을 보여줘요. 서버가 이 정보를 안 주는 응답이면 undefined예요. */
-  retryAfterSeconds?: number;
   constructor(
     message: string,
     status: number,
     fieldErrors?: Record<string, string[]>,
-    retryAfterSeconds?: number,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.fieldErrors = fieldErrors;
-    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -276,27 +270,11 @@ async function apiFetch<T>(
     const d = (data ?? {}) as {
       message?: string;
       errors?: Record<string, string[]>;
-      retry_after?: number | string;
-      retry_after_seconds?: number | string;
     };
-    // ⚠️ 429(너무 많은 요청, Laravel 기본 throttle 미들웨어)일 때 로그인 화면에
-    // "n초 후 다시 시도해주세요" 카운트다운을 보여주려면 대기 시간이 필요해요.
-    // Laravel은 보통 표준 Retry-After 응답 헤더(초 단위)로 내려주고, 일부
-    // 커스텀 응답은 JSON 본문에 retry_after(_seconds) 필드로 실어 보내기도
-    // 해서 둘 다 확인해요. 둘 다 없으면 undefined로 두고(카운트다운 없이
-    // 그냥 에러 메시지만 보여줘요), 429가 아닌 응답에서는 계산하지 않아요.
-    let retryAfterSeconds: number | undefined;
-    if (res.status === 429) {
-      const headerValue = res.headers.get("Retry-After");
-      const bodyValue = d.retry_after ?? d.retry_after_seconds;
-      const n = Number(headerValue ?? bodyValue);
-      if (Number.isFinite(n) && n > 0) retryAfterSeconds = n;
-    }
     throw new ApiError(
       d.message ?? `요청에 실패했어요 (${res.status})`,
       res.status,
       d.errors,
-      retryAfterSeconds,
     );
   }
 
@@ -1054,74 +1032,6 @@ export function extractReviewImageUrls(
     .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
     .map((img) => img.image_url)
     .filter((url): url is string => !!url);
-}
-
-/* --------------------------------- 리뷰 사진 로컬 캐시 --------------------------------- */
-// ⚠️ "리뷰 작성 시 사진이 함께 저장은 되는데, 리뷰를 볼 때(목록 조회) 사진이
-// 안 보인다"는 문제의 원인: GET /api/stores/{store}/reviews(목록 조회) 응답이
-// images를 비워서 내려주는 경우가 있어요(반면 POST 등록 응답엔 실려와요). 그래서
-// "등록 직후엔 보이다가 새로고침하면 사라진다"처럼 보였어요. 실제로 업로드까지
-// 성공한 사진 URL을 이 리뷰 id 기준으로 이 기기(localStorage)에 캐싱해두고,
-// 서버가 images를 비워서 내려줄 때는 이 캐시로 대신 채워서 사진이 계속
-// 보이게 해요. reviews-store.tsx(손님 화면)와 owner-store.tsx(사장님 화면)가
-// 같은 캐시를 공유해서, 둘 중 어느 화면에서 먼저 사진을 봤든 서로 어긋나지 않아요.
-
-const REVIEW_IMAGES_CACHE_KEY = "cafeon_review_images_cache";
-
-function readReviewImagesCache(): Record<string, string[]> {
-  const raw = readStorage(REVIEW_IMAGES_CACHE_KEY);
-  if (!raw) return {};
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? (parsed as Record<string, string[]>) : {};
-  } catch {
-    return {};
-  }
-}
-
-function writeReviewImagesCache(cache: Record<string, string[]>) {
-  writeStorage(REVIEW_IMAGES_CACHE_KEY, JSON.stringify(cache));
-}
-
-/** 이 리뷰(reviewId)에 실제로 업로드까지 성공한 사진 URL들을 이 기기에 캐싱해둬요.
- * 화면에서 방금 직접 고른 사진이라 정확한 값일 때(리뷰 등록/수정 직후) 호출해서,
- * 나중에 서버의 목록 조회 응답이 images를 비워서 내려주더라도 resolveReviewImages가
- * 이 캐시를 대신 써서 사진이 계속 보이게 해요. images가 비어 있으면 아무 것도
- * 안 해요(캐시를 실수로 비우지 않도록). */
-export function cacheReviewImages(
-  reviewId: string | number,
-  images: string[] | undefined | null,
-): void {
-  if (!images || images.length === 0) return;
-  const cache = readReviewImagesCache();
-  cache[String(reviewId)] = images;
-  writeReviewImagesCache(cache);
-}
-
-/** 서버가 준 리뷰 사진(images)을 화면이 쓸 문자열 URL 배열로 바꿔요.
- * - 서버 응답에 사진이 있으면(객체 배열 {id, review_id, image_url, ...} 또는 이미
- *   꺼내진 문자열 배열 둘 다 받아들여요) 그 값을 그대로 쓰는 동시에, 나중을 위해
- *   이 기기에 캐싱해요(캐시가 최신 서버 값을 따라가게 해요).
- * - 서버 응답이 비어 있으면(목록 조회에서 종종 그래요) 이전에 이 리뷰로 캐싱해둔
- *   사진을 대신 돌려줘요. 캐시에도 없으면 빈 배열이에요. */
-export function resolveReviewImages(
-  reviewId: string | number,
-  images: ApiReview["images"] | string[] | undefined | null,
-): string[] {
-  const urls: string[] = !images
-    ? []
-    : images.length === 0
-      ? []
-      : typeof images[0] === "string"
-        ? (images as string[])
-        : extractReviewImageUrls(images as ApiReviewImage[]);
-
-  if (urls.length > 0) {
-    cacheReviewImages(reviewId, urls);
-    return urls;
-  }
-  const cache = readReviewImagesCache();
-  return cache[String(reviewId)] ?? [];
 }
 
 /** 리뷰 작성자 표시 이름을 최대한 넓게 찾아봐요. 스웨거에 이 응답의 정확한
@@ -1924,45 +1834,18 @@ export async function apiGetMyOrderDetail(id: string | number): Promise<ApiOrder
 }
 
 /** POST /api/users/me/orders/{order}/cancel — 주문 취소(매장이 아직 접수 전일 때만
- * 서버가 허용할 것으로 예상돼요. 서버가 422로 거절하면 실패를 돌려줘서, 호출한
- * 쪽에서 "이미 준비 중이라 취소할 수 없어요" 같은 안내를 보여줄 수 있어요).
- *
- * ⚠️ "손님쪽 취소가 예전엔 됐는데 오늘 다시 해보니 안 된다"는 문제의 진짜 원인:
- * 이 함수가 실패 이유를 전부 삼키고(catch에서 그냥 false) 호출부(orders-store의
- * cancelOrder)도 그 결과를 화면에 전혀 보여주지 않아서, 서버가 어떤 이유로든
- * 거절하면(토큰 만료 401, 이미 접수/준비중이라 422, 라우트 이름이 바뀌어 404 등)
- * 사용자 눈에는 버튼을 눌러도 "아무 일도 안 일어나는 것"으로만 보였어요 — 콘솔에도
- * 아무 로그가 안 남아서 원인을 알 방법이 없었고요. 사장님쪽 apiOwnerCancelOrder와
- * 같은 모양으로 상태코드/메시지를 그대로 돌려주고 콘솔에 로그를 남기도록 바꿔서,
- * 다음에 또 실패하면(예: 서버가 이 라우트를 바꿨다면) 개발자 도구 콘솔에서 바로
- * 원인을 확인할 수 있게 하고, 화면에도 실패 사유를 보여줘요. */
-export async function apiCancelMyOrder(
-  id: string | number,
-): Promise<{ ok: boolean; httpStatus?: number; message?: string }> {
-  if (!isApiConfigured()) {
-    return { ok: false, message: "백엔드 서버 주소가 설정되어 있지 않아요." };
-  }
+ * 서버가 허용할 것으로 예상돼요. 서버가 422로 거절하면 false를 돌려줘서, 호출한
+ * 쪽에서 "이미 준비 중이라 취소할 수 없어요" 같은 안내를 보여줄 수 있어요). */
+export async function apiCancelMyOrder(id: string | number): Promise<boolean> {
+  if (!isApiConfigured()) return false;
   try {
     await apiFetch(`/api/users/me/orders/${encodeURIComponent(String(id))}/cancel`, {
       method: "POST",
       authAs: "customer",
     });
-    return { ok: true };
-  } catch (err) {
-    if (err instanceof ApiError) {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[apiCancelMyOrder] 주문 #${id}: POST .../orders/${id}/cancel 응답 ${err.status}: ${err.message}`,
-      );
-      return {
-        ok: false,
-        httpStatus: err.status,
-        message: err.message || `서버가 취소를 거절했어요 (${err.status}).`,
-      };
-    }
-    // eslint-disable-next-line no-console
-    console.error(`[apiCancelMyOrder] 주문 #${id}: 네트워크 오류로 서버에 연결하지 못했어요.`, err);
-    return { ok: false, message: "네트워크 오류로 서버에 연결하지 못했어요." };
+    return true;
+  } catch {
+    return false;
   }
 }
 
