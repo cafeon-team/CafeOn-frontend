@@ -139,9 +139,9 @@ export function setOwnerStoreId(storeId: number | null) {
 export class ApiError extends Error {
   status: number;
   fieldErrors?: Record<string, string[]>;
-  /** 429(요청 과다) 응답일 때, 서버가 Retry-After 헤더로 알려준 "몇 초 뒤에
-   * 다시 시도할 수 있는지"예요. 헤더가 없으면 undefined. 로그인/회원가입 화면이
-   * "n초 후 다시 시도해주세요" 같은 카운트다운을 보여줄 때 써요. */
+  /** 429(너무 많은 요청) 응답일 때, 몇 초 후에 다시 시도할 수 있는지. 로그인
+   * 화면(app/login, app/owner/login)이 이 값으로 "n초 후 다시 시도해주세요"
+   * 카운트다운을 보여줘요. 서버가 이 정보를 안 주는 응답이면 undefined예요. */
   retryAfterSeconds?: number;
   constructor(
     message: string,
@@ -183,16 +183,6 @@ async function apiFetch<T>(
     query?: Record<string, string | number | boolean | undefined>;
     authAs?: AuthAs;
     timeoutMs?: number;
-    /** ⚠️ 429(요청 과다/Too Many Attempts)를 받았을 때 자동 재시도할지 여부.
-     * 기본값 true — 매장/메뉴 조회처럼 "몇백 ms 뒤 백엔드가 밀린 요청을 처리하고
-     * 나면 성공하는" 일반적인 상황을 위한 거예요.
-     * 로그인/회원가입처럼 백엔드의 "로그인 시도 횟수 제한(throttle)"에 걸려서
-     * 429가 난 경우는 성격이 완전히 달라요 — 이건 몇백 ms 안 기다린다고 풀리는
-     * 게 아니라 보통 분 단위로 잠기는 제한이라서, 여기서 자동으로 즉시
-     * 재시도하면 오히려 "시도 횟수"만 추가로 소모해서 잠금이 더 빨리 걸리고
-     * 더 길게 유지돼요. 그래서 로그인/회원가입 API 호출부에서는 이 값을
-     * false로 넘겨서 자동 재시도를 끄고, 실패를 그대로 위로 올려요. */
-    retryOn429?: boolean;
     /** 내부 재시도 호출에서만 써요 — 바깥에서 넘기지 마세요. */
     _retryCount?: number;
   } = {},
@@ -203,7 +193,6 @@ async function apiFetch<T>(
     query,
     authAs = "none",
     timeoutMs = DEFAULT_TIMEOUT_MS,
-    retryOn429 = true,
     _retryCount = 0,
   } = options;
 
@@ -278,18 +267,8 @@ async function apiFetch<T>(
     // "요청 자체가 서버에 도달하지 못하고 거절된" 상황에서는 다시 보내도
     // 안전해서(서버가 실제로 처리를 시작한 뒤 응답만 못 준 경우와는 달라요),
     // 최대 2번까지 짧게 기다렸다가 자동으로 재시도해요.
-    // 429(Too Many Attempts)와 502~504는 둘 다 "요청 자체가 서버에서 처리되지
-    // 못하고 거절됨"이지만 원인은 완전히 달라요:
-    //   - 502~504: 그 순간 서버가 잠깐 응답을 못 만든 것뿐이라, 몇백 ms 뒤
-    //     재시도하면 대부분 성공해요. → 계속 자동 재시도해요.
-    //   - 429: 백엔드의 요청 제한(throttle)에 걸린 거라, 몇백 ms를 기다려도
-    //     안 풀려요(보통 분 단위 window). 게다가 로그인처럼 "시도 횟수 자체"를
-    //     세는 엔드포인트라면 즉시 재시도가 오히려 시도 횟수를 더 빨리
-    //     소모시켜서 잠금을 악화시켜요. → retryOn429가 false인 호출(로그인/
-    //     회원가입)은 재시도하지 않고 바로 실패로 올려요.
-    const isRetryableServerHiccup = res.status >= 502 && res.status <= 504;
-    const isRetryableRateLimit = res.status === 429 && retryOn429;
-    if ((isRetryableServerHiccup || isRetryableRateLimit) && _retryCount < 2) {
+    const isTransient = res.status === 429 || (res.status >= 502 && res.status <= 504);
+    if (isTransient && _retryCount < 2) {
       await delay(400 * (_retryCount + 1));
       return apiFetch<T>(path, { ...options, _retryCount: _retryCount + 1 });
     }
@@ -297,35 +276,27 @@ async function apiFetch<T>(
     const d = (data ?? {}) as {
       message?: string;
       errors?: Record<string, string[]>;
+      retry_after?: number | string;
+      retry_after_seconds?: number | string;
     };
-
+    // ⚠️ 429(너무 많은 요청, Laravel 기본 throttle 미들웨어)일 때 로그인 화면에
+    // "n초 후 다시 시도해주세요" 카운트다운을 보여주려면 대기 시간이 필요해요.
+    // Laravel은 보통 표준 Retry-After 응답 헤더(초 단위)로 내려주고, 일부
+    // 커스텀 응답은 JSON 본문에 retry_after(_seconds) 필드로 실어 보내기도
+    // 해서 둘 다 확인해요. 둘 다 없으면 undefined로 두고(카운트다운 없이
+    // 그냥 에러 메시지만 보여줘요), 429가 아닌 응답에서는 계산하지 않아요.
+    let retryAfterSeconds: number | undefined;
     if (res.status === 429) {
-      // Laravel의 기본 요청 제한 미들웨어는 본문이 있어도 message가 영어
-      // 원문 "Too Many Attempts."로 오고, 몇 초 뒤 다시 시도할 수 있는지는
-      // Retry-After 헤더로만 알려줘요(응답 본문엔 안 담겨 있어요). 이 헤더를
-      // 읽어서 "n초 후 다시 시도해주세요"처럼 실제로 도움이 되는 한국어
-      // 안내로 바꾸고, 화면(로그인 버튼 등)이 카운트다운을 보여줄 수 있게
-      // retryAfterSeconds로 함께 넘겨요.
-      const retryAfterHeader = res.headers.get("Retry-After");
-      const retryAfterSeconds = retryAfterHeader
-        ? Number.parseInt(retryAfterHeader, 10)
-        : undefined;
-      const waitMsg =
-        retryAfterSeconds && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-          ? `${retryAfterSeconds}초 후 다시 시도해주세요.`
-          : "잠시 후 다시 시도해주세요.";
-      throw new ApiError(
-        `요청이 너무 많아 잠시 제한됐어요. ${waitMsg}`,
-        res.status,
-        d.errors,
-        retryAfterSeconds && Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
-      );
+      const headerValue = res.headers.get("Retry-After");
+      const bodyValue = d.retry_after ?? d.retry_after_seconds;
+      const n = Number(headerValue ?? bodyValue);
+      if (Number.isFinite(n) && n > 0) retryAfterSeconds = n;
     }
-
     throw new ApiError(
       d.message ?? `요청에 실패했어요 (${res.status})`,
       res.status,
       d.errors,
+      retryAfterSeconds,
     );
   }
 
@@ -397,15 +368,45 @@ export type ApiStore = {
   business_info?: ApiStoreBusinessInfo | null;
 };
 
-/** POST /api/auth/customer/login — 손님 전용 로그인.
- * 백엔드가 CUSTOMER 권한 계정만 통과시켜요(사장님 계정으로 시도하면 403). */
-export async function apiCustomerLogin(email: string, password: string) {
-  return apiFetch<{ token: string; token_type: string; user: ApiUser }>(
+export type ApiAuthResponse = {
+  token: string;
+  token_type: string;
+  user: ApiUser;
+  store_id?: number;
+  store?: ApiStore;
+  stores?: ApiStore[];
+};
+
+/**
+ * 백엔드 배포 버전에 따라 로그인 성공 응답이 최상위에 오거나
+ * { data: { token, user } }처럼 한 번 감싸져 올 수 있어요. 토큰을 찾지 못한
+ * 상태를 "로그인 성공"으로 처리하면 주문 API가 Bearer 헤더 없이 호출되어 401이
+ * 나므로, 저장 전에 응답을 정규화하고 토큰 누락은 즉시 실패로 처리해요.
+ */
+function normalizeAuthResponse(raw: Record<string, unknown>): ApiAuthResponse {
+  const data = (raw.data ?? raw.result ?? raw) as Record<string, unknown>;
+  const token = pick<string>(data, ["token", "access_token", "accessToken"]);
+  const user = (data.user ?? raw.user) as ApiUser | undefined;
+  if (!token || !user || typeof user !== "object") {
+    throw new ApiError("로그인 응답에서 인증 토큰 또는 사용자 정보를 찾지 못했어요.", 0);
+  }
+  return {
+    token: String(token),
+    token_type: String(pick<string>(data, ["token_type", "tokenType"]) ?? "Bearer"),
+    user,
+    store_id: typeof data.store_id === "number" ? data.store_id : undefined,
+    store: data.store as ApiStore | undefined,
+    stores: data.stores as ApiStore[] | undefined,
+  };
+}
+
+/** POST /api/auth/customer/login — 손님 전용 로그인. */
+export async function apiCustomerLogin(email: string, password: string): Promise<ApiAuthResponse> {
+  const raw = await apiFetch<Record<string, unknown>>(
     "/api/auth/customer/login",
-    // retryOn429: false — 로그인 시도 횟수 제한(throttle)에 걸린 상태에서
-    // 즉시 자동 재시도하면 시도 횟수만 더 쌓여서 잠금이 더 길어져요.
-    { method: "POST", body: { email, password }, retryOn429: false },
+    { method: "POST", body: { email, password } },
   );
+  return normalizeAuthResponse(raw);
 }
 
 /** POST /api/auth/owner/login — 사장님 전용 로그인.
@@ -422,12 +423,7 @@ export async function apiOwnerLogin(email: string, password: string) {
     store_id?: number;
     store?: ApiStore;
     stores?: ApiStore[];
-  }>("/api/auth/owner/login", {
-    method: "POST",
-    body: { email, password },
-    // 위 apiCustomerLogin과 같은 이유로 재시도를 꺼요.
-    retryOn429: false,
-  });
+  }>("/api/auth/owner/login", { method: "POST", body: { email, password } });
 }
 
 /** GET /api/owner/store — 로그인한 사장님의 대표 매장을 조회해요.
@@ -462,7 +458,7 @@ export async function apiSignup(input: {
     token: string;
     token_type: string;
     user: ApiUser;
-  }>("/api/auth/signup", { method: "POST", body: input, retryOn429: false });
+  }>("/api/auth/signup", { method: "POST", body: input });
 }
 
 /** POST /api/auth/owner/signup — 사장님(점주) 회원가입. 응답에 store가 함께 와요. */
@@ -484,11 +480,7 @@ export async function apiOwnerSignup(input: {
     token_type: string;
     user: ApiUser;
     store: ApiStore;
-  }>("/api/auth/owner/signup", {
-    method: "POST",
-    body: input,
-    retryOn429: false,
-  });
+  }>("/api/auth/owner/signup", { method: "POST", body: input });
 }
 
 /** 소셜 로그인(카카오/구글/네이버) 시작 URL.
@@ -556,15 +548,30 @@ export async function apiLogout(authAs: AuthAs) {
   }
 }
 
-/** GET /api/users/me */
+/**
+ * GET /api/users/me (최신) / GET /api/me (Swagger 구버전 호환).
+ * 인증 확인은 결제 전에 반드시 수행해 만료/누락 토큰으로 주문을 생성하지 않아요.
+ */
 export async function apiGetMe(authAs: AuthAs): Promise<ApiUser | null> {
   if (!isApiConfigured()) return null;
-  try {
-    const res = await apiFetch<{ user: ApiUser }>("/api/users/me", { authAs });
-    return res.user;
-  } catch {
-    return null;
+  for (const path of ["/api/users/me", "/api/me"]) {
+    try {
+      const res = await apiFetch<Record<string, unknown>>(path, { authAs });
+      const candidate = (res.user ?? res.data ?? res) as ApiUser;
+      if (candidate && typeof candidate === "object" && typeof candidate.id === "number") {
+        return candidate;
+      }
+    } catch {
+      // 최신 엔드포인트가 없는 구버전 서버에서는 /api/me을 한 번 더 시도해요.
+    }
   }
+  return null;
+}
+
+/** 주문·결제 직전에 고객 토큰의 존재와 서버 인증을 확인해요. */
+export async function apiValidateCustomerSession(): Promise<"valid" | "missing" | "invalid"> {
+  if (!getCustomerToken()) return "missing";
+  return (await apiGetMe("customer")) ? "valid" : "invalid";
 }
 
 /** PUT /api/users/me — 손님 프로필 수정(이름/연락처/프로필사진/생년월일 등).
@@ -586,43 +593,192 @@ export async function apiUpdateMe(input: {
   return res.user;
 }
 
+/** apiUploadImage가 마지막으로 실패한 이유(상태 코드/서버 메시지)를 담아둬요.
+ * ⚠️ 예전엔 실패 이유가 console.error로만 남아서, 개발자 도구를 직접 열어보지
+ * 않으면 "왜" 실패했는지(인증 만료? 파일이 너무 큼? 필드명이 다름? 서버가
+ * 아예 꺼져있음?) 화면에서는 전혀 알 수 없었어요. 다른 lastXxxError들과 같은
+ * 패턴으로, 화면(사장님 프로필/메뉴 사진 등)에 실제 이유를 바로 보여줄 수
+ * 있게 여기 남겨둬요. */
+export let lastUploadImageError: string | null = null;
+
+/** 사진이 너무 크면(요즘 스마트폰 사진은 보통 3~8MB) 업로드 전에 브라우저에서
+ * 미리 줄여요(최대 1600px, JPEG 품질 82%). 서버 최대 허용치(5MB, 스웨거 확인)
+ * 안에 넉넉히 들어오게 하기 위한 안전장치예요. */
+async function compressImageForUpload(file: File): Promise<File> {
+  if (typeof window === "undefined") return file;
+  if (!file.type.startsWith("image/")) return file;
+  // 이미 충분히 작은 사진(1.5MB 이하)은 굳이 다시 인코딩할 필요 없어요.
+  const SIZE_THRESHOLD_BYTES = 1.5 * 1024 * 1024;
+  if (file.size <= SIZE_THRESHOLD_BYTES) return file;
+
+  try {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new window.Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("이미지를 읽지 못했어요."));
+      el.src = dataUrl;
+    });
+
+    const MAX_DIMENSION = 1600;
+    let { width, height } = img;
+    if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+      const scale = MAX_DIMENSION / Math.max(width, height);
+      width = Math.round(width * scale);
+      height = Math.round(height * scale);
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return file;
+    ctx.drawImage(img, 0, 0, width, height);
+
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", 0.82),
+    );
+    // 압축했는데도 원본보다 안 줄었으면(드물지만 이미 최적화된 사진 등) 원본을
+    // 그대로 써요 — 괜히 화질만 잃을 수 있으니까요.
+    if (!blob || blob.size >= file.size) return file;
+
+    const newName = file.name.replace(/\.[^./]+$/, "") + ".jpg";
+    return new File([blob], newName, { type: "image/jpeg" });
+  } catch {
+    // 압축 중 뭔가 실패해도(예: 브라우저 호환성) 원본 파일로라도 업로드를
+    // 시도해봐야 하니 조용히 원본을 돌려줘요.
+    return file;
+  }
+}
+
 /** POST /api/uploads/images — 이미지 업로드(프로필 사진 등 공용 업로드).
- * 2026-08-19 백엔드 변경사항 문서로 응답 형식이 확정됐어요:
- *   { "path": "blog/example.jpg", "url": "http://.../storage/blog/example.jpg" }
- * 프론트에서는 이 url을 그대로 쓰면 돼요(이미 절대 주소라 resolveImageUrl도
- * 그대로 통과시켜요). 혹시 모를 다른 응답 형태에 대비해 image_url/path 및
- * data로 감싼 형태도 순서상 후순위로 계속 지원해요. */
+ * 스웨거로 확정된 스펙: multipart/form-data로 "image" 필드(jpg/jpeg/png/webp/gif,
+ * 최대 5MB)를 받고, 성공하면 { "path": "...", "url": "http://.../storage/..." }
+ * 형태로 돌려줘요. 프론트에서는 이 url을 그대로 쓰면 돼요(이미 절대 주소라
+ * resolveImageUrl도 그대로 통과시켜요). 혹시 모를 다른 응답 형태에 대비해
+ * image_url/path 및 data로 감싼 형태도 순서상 후순위로 계속 지원해요.
+ *
+ * ⚠️ 스펙대로 정확히 보내는데도 이 요청이 500(Server Error)으로 실패한다면,
+ * 그건 프론트 코드 문제가 아니라 백엔드 서버 코드가 요청을 처리하다가 예외를
+ * 던지는 거예요(예: 저장소 디스크 설정, storage:link, 파일 권한 등). 그때는
+ * 백엔드 개발자가 서버(Laravel) 로그를 확인해야 해요 — 프론트 쪽에서 더 시도할
+ * 수 있는 게 없어요. */
 export async function apiUploadImage(
   file: File,
   authAs: AuthAs = "customer",
 ): Promise<string | null> {
-  if (!isApiConfigured()) return null;
+  lastUploadImageError = null;
+  if (!isApiConfigured()) {
+    lastUploadImageError =
+      "백엔드 서버 주소(NEXT_PUBLIC_API_BASE_URL)가 설정돼 있지 않아요.";
+    return null;
+  }
+
+  const token =
+    authAs === "customer"
+      ? getCustomerToken()
+      : authAs === "owner"
+        ? getOwnerToken()
+        : null;
+  // ⚠️ authAs가 "owner"인데 사장님 토큰이 없으면(로그인이 만료됐거나 아직
+  // 안 된 상태) 서버가 401을 돌려주는 게 당연한데, 예전엔 이 경우도 그냥
+  // "사진 업로드에 실패했어요"로만 보여서 사장님 재로그인이 필요하다는 걸
+  // 알 방법이 없었어요. 요청을 보내기 전에 먼저 걸러서 바로 알려줘요.
+  if (!token && authAs !== "none") {
+    lastUploadImageError =
+      authAs === "owner"
+        ? "사장님 로그인이 만료됐거나 안 돼 있어요. 다시 로그인해주세요."
+        : "로그인이 만료됐거나 안 돼 있어요. 다시 로그인해주세요.";
+    // eslint-disable-next-line no-console
+    console.error(`[apiUploadImage] ${lastUploadImageError} authAs=${authAs}`);
+    return null;
+  }
+
+  const uploadFile = await compressImageForUpload(file);
+
+  // ⚠️ 스웨거로 확정된 스펙: POST /api/uploads/images는 파일을 정확히 "image"
+  // 필드명으로, multipart/form-data로, 최대 5MB(jpg/jpeg/png/webp/gif)까지
+  // 받아요. 필드명이 "image"가 맞다는 게 문서로도, 서버의 실제 422 응답
+  // ("file"로 보냈을 때 "The image field is required"라고 정확히 "image"를
+  // 지목한 것)으로도 이중으로 확인됐어요. 그래서 예전처럼 필드명을 추측해서
+  // 여러 번 재시도하는 건 더 이상 의미가 없어요(오히려 실패할 요청을 서버에
+  // 한 번 더 보내는 낭비예요) — 스펙대로 "image" 하나로만 보내요.
+  const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+  if (uploadFile.size > MAX_UPLOAD_BYTES) {
+    lastUploadImageError =
+      "사진이 5MB를 넘어요(서버가 허용하는 최대 용량). 더 작은 사진으로 시도해주세요.";
+    return null;
+  }
+
+  const result = await attemptUploadImage(uploadFile, "image", token);
+  if (result.ok) return result.url;
+
+  lastUploadImageError = result.message;
+  // eslint-disable-next-line no-console
+  console.error(
+    `[apiUploadImage] 업로드 실패 authAs=${authAs} token=${token ? "있음" : "없음"}`,
+    result.rawBody,
+  );
+  return null;
+}
+
+type UploadAttemptResult =
+  | { ok: true; url: string }
+  | { ok: false; status: number; message: string; rawBody: string };
+
+async function attemptUploadImage(
+  file: File,
+  fieldName: string,
+  token: string | null,
+): Promise<UploadAttemptResult> {
   try {
     const form = new FormData();
-    form.append("image", file);
+    form.append(fieldName, file);
 
-    const token =
-      authAs === "customer"
-        ? getCustomerToken()
-        : authAs === "owner"
-          ? getOwnerToken()
-          : null;
     const headers: Record<string, string> = { Accept: "application/json" };
     if (token) headers["Authorization"] = `Bearer ${token}`;
 
-    const res = await fetch(`${API_BASE_URL}/api/uploads/images`, {
-      method: "POST",
-      headers,
-      body: form,
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE_URL}/api/uploads/images`, {
+        method: "POST",
+        headers,
+        body: form,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
     if (!res.ok) {
       const bodyText = await res.text().catch(() => "");
-      // eslint-disable-next-line no-console
-      console.error(
-        `[apiUploadImage] 업로드 실패 (${res.status} ${res.statusText}) authAs=${authAs} token=${token ? "있음" : "없음"}`,
-        bodyText,
-      );
-      return null;
+      // 서버가 JSON 에러 메시지를 준다면(Laravel 검증 오류 등) 그 message를
+      // 꺼내서 보여주고, 아니면 상태 코드만이라도 알려줘요.
+      let serverMessage = "";
+      try {
+        const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+        if (typeof parsed["message"] === "string") serverMessage = parsed["message"];
+      } catch {
+        // JSON이 아니면 무시하고 상태 코드만 사용해요.
+      }
+      const message =
+        res.status === 401 || res.status === 403
+          ? "로그인이 만료됐어요. 다시 로그인 후 시도해주세요."
+          : res.status === 413
+            ? "사진 파일이 너무 커요. 더 작은 사진으로 시도해주세요."
+            : res.status === 422
+              ? `사진을 서버가 거부했어요${serverMessage ? `: ${serverMessage}` : "."}`
+              : res.status === 500
+                ? "업로드 서버에 오류가 있어요(500 Server Error). 요청 형식은 스웨거 스펙과 정확히 일치하는데도 서버 코드가 처리 중 죽는 것으로 보여요 — 프론트에서 고칠 수 있는 부분이 아니라 백엔드 개발자가 서버 로그(Laravel log)를 확인해야 해요."
+                : `업로드 요청이 서버에서 거부됐어요 (${res.status})${serverMessage ? `: ${serverMessage}` : "."}`;
+      return { ok: false, status: res.status, message, rawBody: bodyText };
     }
 
     const data = (await res.json().catch(() => null)) as Record<
@@ -630,9 +786,12 @@ export async function apiUploadImage(
       unknown
     > | null;
     if (!data) {
-      // eslint-disable-next-line no-console
-      console.error("[apiUploadImage] 응답 본문을 JSON으로 읽지 못했어요.");
-      return null;
+      return {
+        ok: false,
+        status: res.status,
+        message: "서버 응답을 읽지 못했어요(JSON 형식이 아니에요).",
+        rawBody: "",
+      };
     }
     const nested =
       data["data"] && typeof data["data"] === "object"
@@ -650,13 +809,23 @@ export async function apiUploadImage(
         "[apiUploadImage] 응답에서 이미지 URL 필드를 못 찾았어요. 실제 응답 형태를 확인해주세요:",
         data,
       );
-      return null;
+      return {
+        ok: false,
+        status: res.status,
+        message:
+          "서버 응답에서 이미지 주소를 찾지 못했어요(응답 형식이 바뀌었을 수 있어요).",
+        rawBody: JSON.stringify(data),
+      };
     }
-    return url;
+    return { ok: true, url };
   } catch (err) {
+    const message =
+      err instanceof DOMException && err.name === "AbortError"
+        ? `서버 응답이 ${Math.round(DEFAULT_TIMEOUT_MS / 1000)}초 안에 오지 않았어요. 네트워크나 서버 상태를 확인해주세요.`
+        : "서버에 연결할 수 없어요. 네트워크 상태를 확인해주세요.";
     // eslint-disable-next-line no-console
     console.error("[apiUploadImage] 네트워크 오류로 업로드에 실패했어요:", err);
-    return null;
+    return { ok: false, status: 0, message, rawBody: "" };
   }
 }
 
@@ -887,67 +1056,72 @@ export function extractReviewImageUrls(
     .filter((url): url is string => !!url);
 }
 
-/** ⚠️ "리뷰를 작성하면 사진이랑 같이 저장은 되는데, 리뷰를 보면 사진이 안 보인다"는
- * 문제의 진짜 원인: POST /api/stores/{store}/reviews(리뷰 등록) 응답에는 방금 올린
- * 사진이 images로 함께 실려 오지만, GET /api/stores/{store}/reviews(리뷰 목록 조회)
- * 응답은 같은 리뷰라도 images를 비워서(또는 아예 안 실어서) 내려줘요. 그래서 등록
- * 직후엔 사진이 보이다가, 목록을 다시 불러오는 순간(새로고침, 다른 화면에서 다시
- * 들어오기, 폴링 등) 사진이 사라져요.
- *
- * 이 함수는 "리뷰 id별 사진 URL"을 이 기기(localStorage)에 별도로 캐싱해서, 서버가
- * 어느 한 번이라도(등록 시점, 또는 목록에 실어준 어느 순간) 이 리뷰의 실제 사진을
- * 보내준 적이 있다면, 그 뒤로 이 기기에서 그 리뷰를 볼 때는(목록 응답이 비어 있어도)
- * 계속 사진이 보이게 해줘요. 카페 상세의 리뷰 탭, 사장님 리뷰 관리 화면, 내 리뷰 관리
- * 화면 모두 이 함수 하나로 통일해서 써요. */
-const REVIEW_IMAGE_CACHE_KEY = "cafeon_review_image_cache";
+/* --------------------------------- 리뷰 사진 로컬 캐시 --------------------------------- */
+// ⚠️ "리뷰 작성 시 사진이 함께 저장은 되는데, 리뷰를 볼 때(목록 조회) 사진이
+// 안 보인다"는 문제의 원인: GET /api/stores/{store}/reviews(목록 조회) 응답이
+// images를 비워서 내려주는 경우가 있어요(반면 POST 등록 응답엔 실려와요). 그래서
+// "등록 직후엔 보이다가 새로고침하면 사라진다"처럼 보였어요. 실제로 업로드까지
+// 성공한 사진 URL을 이 리뷰 id 기준으로 이 기기(localStorage)에 캐싱해두고,
+// 서버가 images를 비워서 내려줄 때는 이 캐시로 대신 채워서 사진이 계속
+// 보이게 해요. reviews-store.tsx(손님 화면)와 owner-store.tsx(사장님 화면)가
+// 같은 캐시를 공유해서, 둘 중 어느 화면에서 먼저 사진을 봤든 서로 어긋나지 않아요.
 
-function readReviewImageCache(): Record<string, string[]> {
-  if (typeof window === "undefined") return {};
+const REVIEW_IMAGES_CACHE_KEY = "cafeon_review_images_cache";
+
+function readReviewImagesCache(): Record<string, string[]> {
+  const raw = readStorage(REVIEW_IMAGES_CACHE_KEY);
+  if (!raw) return {};
   try {
-    const raw = window.localStorage.getItem(REVIEW_IMAGE_CACHE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, string[]>) : {};
   } catch {
     return {};
   }
 }
 
-function writeReviewImageCache(cache: Record<string, string[]>) {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(REVIEW_IMAGE_CACHE_KEY, JSON.stringify(cache));
-  } catch {
-    // 시크릿 모드 등 localStorage를 못 쓰는 환경이면 조용히 무시해요.
-  }
+function writeReviewImagesCache(cache: Record<string, string[]>) {
+  writeStorage(REVIEW_IMAGES_CACHE_KEY, JSON.stringify(cache));
 }
 
-/** 이미 URL 문자열 배열로 확실히 알고 있는 사진(예: 방금 리뷰 수정 화면에서 사용자가
- * 직접 고른 사진)을 리뷰 id에 캐싱해요. PUT 응답 모양을 믿을 수 없을 때, 화면이 이미
- * 알고 있는 값으로 곧바로 캐시를 채우는 용도예요. */
-export function cacheReviewImages(reviewId: number | string, urls: string[]) {
-  if (urls.length === 0) return;
-  const key = String(reviewId);
-  const cache = readReviewImageCache();
-  if (JSON.stringify(cache[key]) !== JSON.stringify(urls)) {
-    writeReviewImageCache({ ...cache, [key]: urls });
-  }
+/** 이 리뷰(reviewId)에 실제로 업로드까지 성공한 사진 URL들을 이 기기에 캐싱해둬요.
+ * 화면에서 방금 직접 고른 사진이라 정확한 값일 때(리뷰 등록/수정 직후) 호출해서,
+ * 나중에 서버의 목록 조회 응답이 images를 비워서 내려주더라도 resolveReviewImages가
+ * 이 캐시를 대신 써서 사진이 계속 보이게 해요. images가 비어 있으면 아무 것도
+ * 안 해요(캐시를 실수로 비우지 않도록). */
+export function cacheReviewImages(
+  reviewId: string | number,
+  images: string[] | undefined | null,
+): void {
+  if (!images || images.length === 0) return;
+  const cache = readReviewImagesCache();
+  cache[String(reviewId)] = images;
+  writeReviewImagesCache(cache);
 }
 
+/** 서버가 준 리뷰 사진(images)을 화면이 쓸 문자열 URL 배열로 바꿔요.
+ * - 서버 응답에 사진이 있으면(객체 배열 {id, review_id, image_url, ...} 또는 이미
+ *   꺼내진 문자열 배열 둘 다 받아들여요) 그 값을 그대로 쓰는 동시에, 나중을 위해
+ *   이 기기에 캐싱해요(캐시가 최신 서버 값을 따라가게 해요).
+ * - 서버 응답이 비어 있으면(목록 조회에서 종종 그래요) 이전에 이 리뷰로 캐싱해둔
+ *   사진을 대신 돌려줘요. 캐시에도 없으면 빈 배열이에요. */
 export function resolveReviewImages(
-  reviewId: number | string,
-  images: ApiReview["images"],
+  reviewId: string | number,
+  images: ApiReview["images"] | string[] | undefined | null,
 ): string[] {
-  const fromServer = extractReviewImageUrls(images);
-  const key = String(reviewId);
-  if (fromServer.length > 0) {
-    // 서버가 이번엔 사진을 실어줬으면, 다음에 비어 있는 응답이 와도 대비할 수 있게
-    // 이 기기에 저장해둬요.
-    cacheReviewImages(reviewId, fromServer);
-    return fromServer;
+  const urls: string[] = !images
+    ? []
+    : images.length === 0
+      ? []
+      : typeof images[0] === "string"
+        ? (images as string[])
+        : extractReviewImageUrls(images as ApiReviewImage[]);
+
+  if (urls.length > 0) {
+    cacheReviewImages(reviewId, urls);
+    return urls;
   }
-  const cache = readReviewImageCache();
-  return cache[key] ?? [];
+  const cache = readReviewImagesCache();
+  return cache[String(reviewId)] ?? [];
 }
 
 /** 리뷰 작성자 표시 이름을 최대한 넓게 찾아봐요. 스웨거에 이 응답의 정확한
@@ -1377,16 +1551,17 @@ export async function apiCreateOrder(input: {
     });
     // eslint-disable-next-line no-console
     console.debug("[주문 생성] 서버 응답 원본:", res);
-    const raw = (res?.["order"] as Record<string, unknown> | undefined) ?? res;
-    const id = raw?.["id"];
-    if (typeof id !== "number") {
+    const envelope = (res?.["data"] as Record<string, unknown> | undefined) ?? res;
+    const raw = (envelope?.["order"] as Record<string, unknown> | undefined) ?? envelope;
+    const parsedId = Number(raw?.["id"] ?? raw?.["order_id"]);
+    if (!Number.isFinite(parsedId)) {
       lastCreateOrderError =
         "주문 생성은 됐지만 응답에서 주문 id를 찾지 못했어요. 브라우저 콘솔의 " +
         "'[주문 생성] 서버 응답 원본'을 확인해서 실제 필드명을 알려주시면 매칭시켜 드릴게요.";
       return null;
     }
     return {
-      id,
+      id: parsedId,
       store_id: Number(raw["store_id"] ?? input.store_id),
       status: raw["status"] as string | undefined,
       total_amount:
@@ -1608,9 +1783,27 @@ function parseOrderItem(raw: Record<string, unknown>): ApiOrderItemDetail {
   };
 }
 
+let warnedMissingOrderUser = false;
+
 function parseOrder(raw: Record<string, unknown>): ApiOrderDetail {
   const store = pick<Record<string, unknown>>(raw, ["store"]);
   const user = pick<Record<string, unknown>>(raw, ["user", "customer", "buyer", "orderer"]);
+
+  // ⚠️ 진단용 로그(개발 중 1번만 출력): "손님 이름/사진이 이제 안 보여요" 문제는
+  // 크게 두 가지 원인이 있어요 — (1) 필드 이름이 우리가 시도하는 후보 목록과
+  // 달라서 user 객체는 있는데 못 찾는 경우, (2) 이 목록 API 응답 자체에
+  // user/customer 관계가 통째로 빠져 있는 경우(=프론트에서 고칠 수 없고 백엔드가
+  // eager-load를 추가해야 함). 아래 로그로 실제 응답에 어떤 최상위 키가 있는지
+  // 콘솔에서 바로 확인해서 둘 중 뭔지 구분할 수 있어요.
+  if (!user && !warnedMissingOrderUser && typeof window !== "undefined") {
+    warnedMissingOrderUser = true;
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[parseOrder] 주문 응답에 user/customer/buyer/orderer 관계가 없어요. " +
+        "이 목록 API가 손님 정보를 아예 안 내려주는 것일 수 있어요. 실제 응답 키:",
+      Object.keys(raw),
+    );
+  }
   const itemsRaw = pick<unknown[]>(raw, ["items", "order_items", "orderItems"]) ?? [];
   const id = Number(pick(raw, ["id"]) ?? 0);
   const storeId = pick<number>(raw, ["store_id"]) ?? (store ? pick<number>(store, ["id"]) : undefined);
@@ -1626,11 +1819,16 @@ function parseOrder(raw: Record<string, unknown>): ApiOrderDetail {
   // ⚠️ 예전의 hint(주문 생성 화면이 저장해둔 캐시) 방식은 "내가 우리 앱 결제
   // 화면으로 직접 주문한 경우"에만 동작해요 — 사장님 화면(다른 브라우저/기기)이나
   // 스웨거로 직접 만든 테스트 주문에는 애초에 hint가 없어서 0원이 그대로
-  // 보였어요(스크린샷의 사장님 화면·주문내역·서버 응답 모두 0원인 이유). 메뉴
-  // 줄 가격은 서버가 항상 정확히 주므로, hint보다 먼저 "메뉴 줄 합계"로
-  // 우선 계산하고, 그마저 없을 때만 hint/서버값 순으로 내려가요.
+  // 보였어요(스크린샷의 사장님 화면·주문내역·서버 응답 모두 0원인 이유). 서버가
+  // final_amount를 안 주는 옛 버전 응답일 때를 대비해, final_amount가 없거나
+  // 0일 때만 "메뉴 줄 합계"로 계산하고, 그마저 없을 때만 hint로 내려가요.
+  // ⚠️ 2026-08-26 실제 서버 응답(GET /api/owner/stores/{store}/orders)으로 확정:
+  // 총액 필드명은 total_amount/amount가 아니라 final_amount(쿠폰 할인까지
+  // 반영된 최종 결제 금액)예요. menu_amount는 할인 반영 전 금액이라 다를 수
+  // 있어요. final_amount를 최우선으로 쓰고, 혹시 없는 버전의 응답이면 기존
+  // 후보(total_amount/amount) → 메뉴 줄 합계 순으로 내려가요.
   const hint = id ? getOrderHint(id) : null;
-  let totalAmount = Number(pick(raw, ["total_amount", "amount"]) ?? 0);
+  let totalAmount = Number(pick(raw, ["final_amount", "total_amount", "amount"]) ?? 0);
   let items = Array.isArray(itemsRaw)
     ? itemsRaw.map((it) => parseOrderItem(it as Record<string, unknown>))
     : [];
@@ -1660,12 +1858,14 @@ function parseOrder(raw: Record<string, unknown>): ApiOrderDetail {
       pick<string>(raw, ["customer_name", "user_name"]) ??
       (user ? pick<string>(user, ["name"]) : undefined) ??
       null,
-    // ⚠️ 주문 목록/상세 응답 스키마가 스웨거에 없어서(성공 200만 명시), 손님
-    // 프로필(ApiUser)과 같은 후보 필드명들(profile_image_url 우선)을 최대한
-    // 넓게 순서대로 시도해요. user/customer 객체 안, 최상위 raw 둘 다 찾아봐요.
-    // ⚠️ 그래도 안 뜨면 필드명이 안 맞아서가 아니라, 이 목록 API 응답 자체에
-    // 손님 관계(user/customer)가 아예 포함 안 돼 있을 가능성이 커요 — 그땐
-    // 실제 응답 JSON을 확인해서 정확한 키로 다시 맞춰야 해요.
+    // ⚠️ 2026-08-26 실제 서버 응답(GET /api/owner/stores/{store}/orders)으로 확정:
+    // user 객체엔 id/name/email/phone만 내려오고 프로필 사진 필드는 전혀
+    // 없어요(profile_image_url도, 다른 어떤 이름의 이미지 필드도 없음). 즉
+    // 필드명을 못 찾아서가 아니라 서버가 이 응답에 사진 데이터 자체를 아예
+    // 안 담아 보내고 있는 거예요 — 프론트 코드로는 고칠 수 없고, 백엔드에서
+    // 이 엔드포인트의 user 관계에 프로필 이미지 필드를 추가해줘야 해결돼요.
+    // 혹시 나중에 백엔드가 필드를 추가해줄 걸 대비해서 아래 후보 이름들은
+    // 그대로 남겨둬요(추가되는 순간 별도 수정 없이 바로 동작하도록).
     customerImageUrl: resolveImageUrl(
       (user
         ? pick<string>(user, [
@@ -1724,18 +1924,45 @@ export async function apiGetMyOrderDetail(id: string | number): Promise<ApiOrder
 }
 
 /** POST /api/users/me/orders/{order}/cancel — 주문 취소(매장이 아직 접수 전일 때만
- * 서버가 허용할 것으로 예상돼요. 서버가 422로 거절하면 false를 돌려줘서, 호출한
- * 쪽에서 "이미 준비 중이라 취소할 수 없어요" 같은 안내를 보여줄 수 있어요). */
-export async function apiCancelMyOrder(id: string | number): Promise<boolean> {
-  if (!isApiConfigured()) return false;
+ * 서버가 허용할 것으로 예상돼요. 서버가 422로 거절하면 실패를 돌려줘서, 호출한
+ * 쪽에서 "이미 준비 중이라 취소할 수 없어요" 같은 안내를 보여줄 수 있어요).
+ *
+ * ⚠️ "손님쪽 취소가 예전엔 됐는데 오늘 다시 해보니 안 된다"는 문제의 진짜 원인:
+ * 이 함수가 실패 이유를 전부 삼키고(catch에서 그냥 false) 호출부(orders-store의
+ * cancelOrder)도 그 결과를 화면에 전혀 보여주지 않아서, 서버가 어떤 이유로든
+ * 거절하면(토큰 만료 401, 이미 접수/준비중이라 422, 라우트 이름이 바뀌어 404 등)
+ * 사용자 눈에는 버튼을 눌러도 "아무 일도 안 일어나는 것"으로만 보였어요 — 콘솔에도
+ * 아무 로그가 안 남아서 원인을 알 방법이 없었고요. 사장님쪽 apiOwnerCancelOrder와
+ * 같은 모양으로 상태코드/메시지를 그대로 돌려주고 콘솔에 로그를 남기도록 바꿔서,
+ * 다음에 또 실패하면(예: 서버가 이 라우트를 바꿨다면) 개발자 도구 콘솔에서 바로
+ * 원인을 확인할 수 있게 하고, 화면에도 실패 사유를 보여줘요. */
+export async function apiCancelMyOrder(
+  id: string | number,
+): Promise<{ ok: boolean; httpStatus?: number; message?: string }> {
+  if (!isApiConfigured()) {
+    return { ok: false, message: "백엔드 서버 주소가 설정되어 있지 않아요." };
+  }
   try {
     await apiFetch(`/api/users/me/orders/${encodeURIComponent(String(id))}/cancel`, {
       method: "POST",
       authAs: "customer",
     });
-    return true;
-  } catch {
-    return false;
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof ApiError) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[apiCancelMyOrder] 주문 #${id}: POST .../orders/${id}/cancel 응답 ${err.status}: ${err.message}`,
+      );
+      return {
+        ok: false,
+        httpStatus: err.status,
+        message: err.message || `서버가 취소를 거절했어요 (${err.status}).`,
+      };
+    }
+    // eslint-disable-next-line no-console
+    console.error(`[apiCancelMyOrder] 주문 #${id}: 네트워크 오류로 서버에 연결하지 못했어요.`, err);
+    return { ok: false, message: "네트워크 오류로 서버에 연결하지 못했어요." };
   }
 }
 
@@ -1908,6 +2135,8 @@ export type ApiMenu = {
   price: string;
   image_url?: string | null;
   is_available: boolean;
+  /** 재고 수량. null/undefined = 무제한. 서버가 이 필드를 아직 안 내려줄 수도 있어요. */
+  stock?: number | null;
 };
 
 /** GET /api/owner/menus — "사장님 운영정보 재로그인 복원" 문서(섹션 11-3)로 확정된 경로.
@@ -1947,6 +2176,7 @@ export async function apiOwnerCreateMenu(input: {
   description?: string | null;
   image_url?: string | null;
   is_available?: boolean;
+  stock?: number | null;
 }): Promise<ApiMenu | null> {
   if (!isApiConfigured()) return null;
   try {
@@ -1997,6 +2227,7 @@ export async function apiOwnerUpdateMenu(
     description: string | null;
     image_url: string | null;
     is_available: boolean;
+    stock: number | null;
   }>,
 ): Promise<boolean> {
   if (!isApiConfigured()) return false;
@@ -2143,6 +2374,59 @@ export async function apiOwnerUpdateOrderStatus(
     )}) 전부 422로 거절됐어요. 이 주문이 이미 취소/완료된 상태이거나(먼저 GET .../orders로 현재 status를 확인해보세요), 이 목록에 실제 enum 값이 없을 수 있어요 — 백엔드에 이 엔드포인트가 실제로 받는 status 값을 문의해주세요.`,
   );
   return { ok: false, ...lastError };
+}
+
+/** POST /api/owner/orders/{order}/cancel — 사장님이 주문을 취소할 때 전용으로 써요.
+ * ⚠️ "결제대기"/"준비완료" 주문을 위 apiOwnerUpdateOrderStatus로 취소하려 하면
+ * CANCELLED/CANCELED/REJECTED 후보를 전부 보내도 매번 422("The selected status
+ * is invalid.")로 거절됐어요. 반면 손님쪽 주문 취소(apiCancelMyOrder)는 애초에
+ * status PATCH가 아니라 POST /api/users/me/orders/{id}/cancel이라는 전용
+ * 엔드포인트를 쓰고 있고 실제로 잘 동작해요 — 즉 서버가 "취소"만큼은 status enum
+ * 값이 아니라 별도의 전용 취소 액션으로 받는 걸로 보여요. 사장님쪽에도 그 대칭
+ * 엔드포인트가 있을 걸로 보고 먼저 시도하고, 혹시 아직 없는 서버(404)라면 예전
+ * 방식(PATCH .../status 후보값 재시도)으로 자동 대체해서, 엔드포인트 이름이
+ * 다르더라도 기존에 되던 방식이 계속 동작하게 해요. */
+export async function apiOwnerCancelOrder(
+  orderId: string | number,
+): Promise<{ ok: boolean; httpStatus?: number; message?: string }> {
+  if (!isApiConfigured()) {
+    return { ok: false, message: "백엔드 서버 주소가 설정되어 있지 않아요." };
+  }
+  try {
+    await apiFetch(`/api/owner/orders/${encodeURIComponent(String(orderId))}/cancel`, {
+      method: "POST",
+      authAs: "owner",
+    });
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) {
+      // 전용 취소 엔드포인트가 아직 없는 서버(라우트 자체가 없음)라면, 예전
+      // 방식(PATCH .../status)으로 대신 시도해요.
+      // ⚠️ 화면에 뜨는 오류 메시지만 봐서는 "전용 취소 API가 아예 없어서
+      // 예전 방식으로 넘어갔다가 그것도 실패한 것"인지, "전용 취소 API
+      // 자체가 다른 이유로 실패한 것"인지 구분이 안 돼서, 개발자 도구 없이도
+      // 알 수 있게 어느 단계에서 실패했는지를 메시지 앞에 표시해요.
+      // eslint-disable-next-line no-console
+      console.error(
+        `[apiOwnerCancelOrder] 주문 #${orderId}: POST .../orders/${orderId}/cancel 라우트가 없어요(404). PATCH .../status 방식으로 대신 시도해요.`,
+      );
+      const fallback = await apiOwnerUpdateOrderStatus(orderId, "CANCELLED");
+      return {
+        ...fallback,
+        message: fallback.message
+          ? `전용 취소 API(POST .../cancel)가 없어 예전 방식으로 시도했지만 실패: ${fallback.message}`
+          : fallback.message,
+      };
+    }
+    if (err instanceof ApiError) {
+      return {
+        ok: false,
+        httpStatus: err.status,
+        message: `취소 API(POST .../cancel) 응답 ${err.status}: ${err.message}`,
+      };
+    }
+    return { ok: false, message: "네트워크 오류로 서버에 연결하지 못했어요." };
+  }
 }
 
 /** POST /api/owner/reviews/{review}/reply
