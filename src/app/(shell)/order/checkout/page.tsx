@@ -103,6 +103,14 @@ export default function OrderCheckoutPage() {
     }));
     const snapshotAmount = finalAmount;
 
+    if (!Number.isFinite(snapshotAmount) || snapshotAmount <= 0) {
+      setCreating(false);
+      setCreateError(
+        "결제금액이 0원입니다. 가격이 등록된 메뉴를 다시 담거나 사용 포인트를 조정해주세요.",
+      );
+      return;
+    }
+
     const order = await apiCreateOrder({
       store_id: Number(cart.cafeId),
       items: cart.items.map((i) => ({ menu_id: Number(i.id), quantity: i.quantity })),

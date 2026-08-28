@@ -100,6 +100,11 @@ export default function OwnerMenuPage() {
   };
   const submitEdit = async () => {
     if (!editingId) return;
+    const price = Number(form.price);
+    if (!Number.isFinite(price) || price <= 0) {
+      setErrorMsg("메뉴 가격은 1원 이상 입력해주세요.");
+      return;
+    }
     setSaving(true);
     setErrorMsg(null);
     const { ok: uploadOk, imageUrl } = await resolveImageForSave();
@@ -122,7 +127,7 @@ export default function OwnerMenuPage() {
     // 이제 결과를 기다렸다가 실패하면 화면을 닫지 않고 에러를 보여줘요.
     const result = await updateMenuItem(editingId, {
       name: form.name.trim() || "이름 없음",
-      price: Number(form.price) || 0,
+      price,
       category: form.category,
       stock: form.stock.trim() === "" ? null : Number(form.stock),
       imageUrl,
@@ -142,6 +147,11 @@ export default function OwnerMenuPage() {
 
   const submitAdd = async () => {
     if (!form.name.trim() || saving) return;
+    const price = Number(form.price);
+    if (!Number.isFinite(price) || price <= 0) {
+      setErrorMsg("메뉴 가격은 1원 이상 입력해주세요.");
+      return;
+    }
     setSaving(true);
     setErrorMsg(null);
     const { ok: uploadOk, imageUrl } = await resolveImageForSave();
@@ -154,7 +164,7 @@ export default function OwnerMenuPage() {
     }
     const result = await addMenuItem({
       name: form.name.trim(),
-      price: Number(form.price) || 0,
+      price,
       category: form.category,
       stock: form.stock.trim() === "" ? null : Number(form.stock),
       imageUrl,

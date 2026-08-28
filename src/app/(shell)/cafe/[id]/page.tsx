@@ -277,12 +277,12 @@ export default function CafeDetailPage({ params }: { params: { id: string } }) {
     // 내려줘요("재고 관련 필드가 메뉴 API엔 없다"는 걸 확인한 뒤, 실제로
     // 존재·저장되는 이 필드로 품절을 표현해요). 손님 화면에서도 품절인 메뉴는
     // "재고 없음"으로 보여주고 담기 버튼을 막아요.
-    soldOut: m.is_available === false,
+    soldOut: m.is_available === false || !Number.isFinite(Number(m.price)) || Number(m.price) <= 0,
   }));
 
   const handleAddToCart = (m: { id: string; name: string; price: number; soldOut?: boolean }) => {
     // 품절 메뉴는 버튼도 비활성화돼 있지만, 혹시 모를 경우를 대비해 한 번 더 막아요.
-    if (m.soldOut) return;
+    if (m.soldOut || !Number.isFinite(m.price) || m.price <= 0) return;
     // ⚠️ 예전엔 비로그인 상태로 "담기"를 누르면 곧장 /login(로그인 입력 폼)으로
     // 보냈는데, "예약하기"를 누를 때는 다른 화면이 떠요 — /reserve/new는
     // isPublicPath에 없어서 AuthGate가 가로채 "로그인이 필요해요" 안내 화면을
